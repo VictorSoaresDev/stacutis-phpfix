@@ -1,5 +1,19 @@
 # Stacutis PHP2Shell scanner
 
+## Run this on the server
+
+Paste this into the server's terminal. It downloads the scanner, checks the file, and scans. A scan changes nothing. If a menu appears, option 4 leaves the server as it is. An upgrade still waits for a separate yes.
+
+```sh
+cd /tmp &&
+curl -fsSL -O https://raw.githubusercontent.com/VictorSoaresDev/stacutis-phpfix/main/stacutis-php2shell.sh &&
+curl -fsSL -O https://raw.githubusercontent.com/VictorSoaresDev/stacutis-phpfix/main/CHECKSUMS.txt &&
+sha256sum -c CHECKSUMS.txt &&
+bash stacutis-php2shell.sh
+```
+
+The check must print `stacutis-php2shell.sh: OK`.
+
 `stacutis-php2shell.sh` is a local command-line tool. A server owner downloads it, reads it, and runs it on a Linux host they administer. It reports whether the PHP installs on that host are exposed to PHP2Shell, and it can upgrade PHP or write temporary settings after an explicit yes.
 
 The tool version in this tree is **1.0.0**. The CVE data date is **2026-10-22**. If the banner says that date is more than 14 days behind the clock, read the PHP advisory again before you trust a PATCHED result.
