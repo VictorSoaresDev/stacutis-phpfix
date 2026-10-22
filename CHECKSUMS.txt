@@ -1,0 +1,5 @@
+# SHA-256 of stacutis-php2shell.sh. Signing instructions are in README.md.
+# A signature is useful only when the public key arrives on a second channel.
+#   gpg --detach-sign --armor --output stacutis-php2shell.sh.asc stacutis-php2shell.sh
+#   minisign -Sm stacutis-php2shell.sh
+51b451c66984a3ad9b0f8f71f16474e86b9746df9406a88b9de0ed8930b4c09c  stacutis-php2shell.sh
