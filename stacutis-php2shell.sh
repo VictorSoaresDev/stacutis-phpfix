@@ -251,6 +251,25 @@ out() {
   printf '%s\n' "$1"
 }
 
+# Tradeoff lines stay visible under --quiet and --json (stderr), in red on a terminal.
+tradeoff() {
+  local line="${RED}${BOLD}Tradeoff:${RESET} ${RED}$1${RESET}"
+  if [[ "$JSON" -eq 1 || "$QUIET" -eq 1 ]]; then
+    printf '%s\n' "$line" >&2
+    return 0
+  fi
+  printf '\n%s\n' "$line"
+}
+
+workaround_banner() {
+  local line="${RED}${BOLD}These settings leave the vulnerable PHP installed. MITIGATED is still vulnerable. PHP restarts and drops requests in flight.${RESET}"
+  if [[ "$JSON" -eq 1 || "$QUIET" -eq 1 ]]; then
+    printf '%s\n' "$line" >&2
+    return 0
+  fi
+  printf '\n%s\n' "$line"
+}
+
 checked_again() {
   out ""
   out "${BOLD}Checked again${RESET}"
@@ -2055,7 +2074,7 @@ human_report() {
     "$patch_c" "$COUNT_PATCH" "$RESET" \
     "$unk_c" "$COUNT_UNK" "$RESET"
   if ((COUNT_MIT > 0)); then
-    printf '\n%sStill VULNERABLE until PHP is upgraded. Mitigations are not a patch.%s\n' "$YELLOW" "$RESET"
+    printf '\n%sStill VULNERABLE until PHP is upgraded. Mitigations are not a patch.%s\n' "$RED" "$RESET"
   fi
   if [[ "$MOD_PHP" -eq 1 ]]; then
     printf '\n%smod_php is loaded. This tool rates it highest risk: the CVE-2026-109618 advisory shows code execution when mod_php runs shutdown after a failed startup.%s\n' "$RED" "$RESET"
@@ -2605,22 +2624,46 @@ cgroup_memory_note() {
   say "No cgroup memory.max was readable. memory_limit=-1 would drop PHP's own cap unless the host limits memory another way."
 }
 
+print_active_tradeoffs() {
+  workaround_banner
+  if [[ "$WORK_UPLOAD" -eq 1 ]]; then
+    tradeoff "Upload progress off stops bars that use PHP_SESSION_UPLOAD_PROGRESS. It closes one confirmed path. Other ways into the bug stay open."
+  fi
+  if [[ "$WORK_FATAL" -eq 1 ]]; then
+    tradeoff "On PHP 8.5, fatal errors lose this backtrace. It blocks one confirmed producer of the stale-state bug."
+  fi
+  if [[ -n "$UPLOAD_POLICY" ]]; then
+    tradeoff "Posts and uploads larger than the new cap fail. The site cannot raise the limit afterward."
+  fi
+  if [[ "$DO_UNLIMITED_MEM" -eq 1 ]]; then
+    tradeoff "memory_limit=-1 removes PHP's RAM cap. One request can grow until the cgroup limit or the OS OOM killer. An allocation failure can still reach the bug. RLIMIT_AS and RLIMIT_DATA are not set."
+  fi
+  if [[ "$DO_MAX_REQUESTS" -eq 1 ]]; then
+    tradeoff "pm.max_requests=1 exits every FPM worker after one request. Under load that costs CPU, adds latency, and can fill the listen queue."
+  fi
+}
+
 ask_workaround_flags() {
   if [[ "$ASSUME_YES" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
     WORK_UPLOAD=1
     WORK_FATAL=1
+    print_active_tradeoffs
     return 0
   fi
   WORK_UPLOAD=0
   WORK_FATAL=0
-  if confirm "Set session.upload_progress.enabled=0 in admin config? The advisory calls this a confirmed session path, and it is not a fix"; then
+  workaround_banner
+  tradeoff "Upload progress off stops bars that use PHP_SESSION_UPLOAD_PROGRESS. It closes one confirmed path. Other ways into the bug stay open."
+  if confirm "Set session.upload_progress.enabled=0 in admin config?"; then
     WORK_UPLOAD=1
   fi
-  if confirm "On PHP 8.5 only, set fatal_error_backtraces=0? The advisory says this blocks one confirmed path"; then
+  tradeoff "On PHP 8.5, fatal errors lose this backtrace. It blocks one confirmed producer of the stale-state bug."
+  if confirm "On PHP 8.5 only, set fatal_error_backtraces=0?"; then
     WORK_FATAL=1
   fi
   if [[ -z "$UPLOAD_POLICY" ]]; then
-    if confirm "Tighten post_max_size? No means leave request size alone"; then
+    tradeoff "Posts and uploads larger than the new cap fail. The site cannot raise the limit afterward. Answering no leaves request size alone."
+    if confirm "Tighten post_max_size?"; then
       local reply
       printf 'File uploads required? y = post_max_size 32M and upload_max_filesize 8M; n = 8M and 2M [y/N] ' >&2
       read -r reply || reply=""
@@ -2630,19 +2673,25 @@ ask_workaround_flags() {
         UPLOAD_POLICY="none"
       fi
     fi
+  else
+    tradeoff "Posts and uploads larger than the new cap fail. The site cannot raise the limit afterward."
   fi
   if [[ "$DO_UNLIMITED_MEM" -eq 0 ]]; then
     cgroup_memory_note
-    say "memory_limit=-1 removes PHP's memory guard. The OOM advisory says an underlying allocation failure can still reach the bug. This tool will not set RLIMIT_AS or RLIMIT_DATA."
+    tradeoff "memory_limit=-1 removes PHP's RAM cap. One request can grow until the cgroup limit or the OS OOM killer. An allocation failure can still reach the bug. This tool will not set RLIMIT_AS or RLIMIT_DATA."
     if confirm "Lock memory_limit=-1 with php_admin_value on web SAPIs?"; then
       DO_UNLIMITED_MEM=1
     fi
+  else
+    tradeoff "memory_limit=-1 removes PHP's RAM cap. One request can grow until the cgroup limit or the OS OOM killer. An allocation failure can still reach the bug. RLIMIT_AS and RLIMIT_DATA are not set."
   fi
   if [[ "$DO_MAX_REQUESTS" -eq 0 ]]; then
-    say "pm.max_requests=1 recycles every FPM worker after one request. The stale-state advisory lists it only when performance does not matter. It is not a fix."
+    tradeoff "pm.max_requests=1 exits every FPM worker after one request. Under load that costs CPU, adds latency, and can fill the listen queue."
     if confirm "Set pm.max_requests=1 on vulnerable FPM pools?"; then
       DO_MAX_REQUESTS=1
     fi
+  else
+    tradeoff "pm.max_requests=1 exits every FPM worker after one request. Under load that costs CPU, adds latency, and can fill the listen queue."
   fi
 }
 
@@ -2769,8 +2818,8 @@ apply_workarounds() {
     return 0
   fi
   out ""
-  out "${YELLOW}Still VULNERABLE until PHP is upgraded.${RESET}"
-  printf '\n%s%sStill VULNERABLE until PHP is upgraded.%s\n' "$BOLD" "$YELLOW" "$RESET" >&2
+  out "${RED}Still VULNERABLE until PHP is upgraded.${RESET}"
+  printf '\n%s%sStill VULNERABLE until PHP is upgraded.%s\n' "$BOLD" "$RED" "$RESET" >&2
   if ! restart_affected; then
     err "settings were written and at least one restart failed. Old workers may still be in memory."
     return 4
@@ -3239,24 +3288,28 @@ show_options() {
   out "${BOLD}Option 2, temporary settings${RESET}"
   out "Each setting waits for its own yes."
   out "Nothing is written to .user.ini, and ini_set is not called. Those do not apply early enough."
+  workaround_banner
   out ""
   out "  ${BOLD}Upload progress off${RESET}"
   out "  session.upload_progress.enabled=0 in conf.d, FPM php_admin_flag, and Apache"
+  tradeoff "Upload progress off stops bars that use PHP_SESSION_UPLOAD_PROGRESS. It closes one confirmed path. Other ways into the bug stay open."
   out ""
   out "  ${BOLD}Fatal backtraces off${RESET}  ${CYAN}PHP 8.5 only${RESET}"
   out "  fatal_error_backtraces=0"
+  tradeoff "On PHP 8.5, fatal errors lose this backtrace. It blocks one confirmed producer of the stale-state bug."
   out ""
   out "  ${BOLD}Post size${RESET}  ${CYAN}only when you choose a policy${RESET}"
   out "  No uploads: post_max_size 8M and upload_max_filesize 2M"
   out "  Uploads: post_max_size 32M and upload_max_filesize 8M"
   out "  8M and 32M are the advisory's post_max_size figures. 2M and 8M are this tool's choices for a smaller upload_max_filesize."
+  tradeoff "Posts and uploads larger than the new cap fail. The site cannot raise the limit afterward."
   out ""
   out "  ${BOLD}Optional, and not the default${RESET}"
   out "  memory_limit=-1 via php_admin_value only, with a cgroup cap. Never RLIMIT_AS or RLIMIT_DATA."
+  tradeoff "memory_limit=-1 removes PHP's RAM cap. One request can grow until the cgroup limit or the OS OOM killer. An allocation failure can still reach the bug."
   out "  pm.max_requests=1, which the stale-state advisory mentions when performance does not matter"
+  tradeoff "pm.max_requests=1 exits every FPM worker after one request. Under load that costs CPU, adds latency, and can fill the listen queue."
   print_proxy_advice
-  out ""
-  out "${YELLOW}Option 2 leaves the install vulnerable.${RESET}"
 }
 
 menu() {
@@ -3269,7 +3322,7 @@ menu() {
     out "       ${CYAN}Recommended. Only a confirmed package is installed.${RESET}"
     out ""
     out "  ${YELLOW}[2]${RESET}  Temporary settings"
-    out "       ${CYAN}Lowers risk. The install stays vulnerable.${RESET}"
+    out "       ${RED}Leaves the vulnerable PHP installed. Upload progress stops. Later questions can break large uploads, remove PHP's RAM cap, or recycle every FPM worker.${RESET}"
     out ""
     out "  ${BOLD}[3]${RESET}  Show exactly what each option will change"
     out ""
@@ -3392,7 +3445,7 @@ main() {
       checked_again
       report_all
       out ""
-      out "${YELLOW}Still VULNERABLE until PHP is upgraded.${RESET}"
+      out "${RED}Still VULNERABLE until PHP is upgraded.${RESET}"
     fi
     if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
       exit "$rc"
