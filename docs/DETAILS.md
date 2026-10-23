@@ -107,3 +107,7 @@ Sources: [PHP 21 October 2026 release](https://www.php.net/archive/2026.php#2026
 - The changelog server sometimes returns 404 for new security uploads. In that case the candidate cannot be confirmed and the script says so. It does not upgrade on a guess.
 - IOC checks: crash lines and journal timestamps only, access logs are streamed, and only outbound connections from PHP processes are listed.
 - Containers: docker and podman. `--containers-exec` probes every running container; without it only PHP-named containers are listed.
+- Running the scan without root prints a warning, because some files and /proc entries cannot be read. Results can then be UNKNOWN.
+- Repeated `--workarounds` runs give the same files. The marked block is replaced, and blank lines do not pile up.
+- JSON output escapes every control character.
+- Ini parsing skips `[PATH=...]` and `[HOST=...]` sections, keeps `;` inside quotes, and treats `key =` as an empty value.
