@@ -3255,8 +3255,18 @@ apply_workarounds() {
         fi
       done < <(vulnerable_indexes)
       if [[ -z "$a_major" ]]; then
-        a_major=8
-        a_minor=3
+        # No mod_php version: use the newest vulnerable branch found, so an
+        # 8.5 host still gets the 8.5 setting.
+        while IFS= read -r i; do
+          [[ -n "${F_VERSION[i]}" ]] || continue
+          rest=${F_VERSION[i]#*.}
+          local c_major=${F_VERSION[i]%%.*} c_minor=${rest%%.*}
+          [[ "$c_major" =~ ^[0-9]+$ && "$c_minor" =~ ^[0-9]+$ ]] || continue
+          if [[ -z "$a_major" ]] || (( c_major > a_major || (c_major == a_major && c_minor > a_minor) )); then
+            a_major=$c_major
+            a_minor=$c_minor
+          fi
+        done < <(vulnerable_indexes)
       fi
       if [[ "$failed" -eq 0 && -f "$(rootp "$a_logical")" ]]; then
         backup_existing "$a_logical" || failed=1
@@ -3719,8 +3729,7 @@ do_fix() {
 
   local unique
   unique=$(printf '%s\n' "${install_pkgs[@]}" | awk '!seen[$0]++')
-  # shellcheck disable=SC2206
-  install_pkgs=($unique)
+  mapfile -t install_pkgs < <(printf '%s\n' "$unique" | awk 'NF')
 
   if [[ -n "$TEST_ROOT" ]]; then
     local p
