@@ -1,8 +1,28 @@
 #!/usr/bin/env bash
-# stacutis-php2shell — scan a Linux host for PHP2Shell and, only after a
-# yes, upgrade PHP with the distro package manager or apply temporary
-# settings. It does not scan other hosts, does not send telemetry, and
-# does not compile PHP.
+# stacutis-php2shell: scan a Linux host for PHP2Shell
+# (CVE-2026-109618 / CVE-2026-109619) and, only if you say yes, fix it.
+#
+# What it reads (default, scan only):
+#   - php / php-fpm / php-cgi / lsphp / frankenphp binaries and their -v output
+#   - PHP ini files, FPM pool configs, Apache config (to spot mod_php)
+#   - the local package database and package changelogs (dpkg, rpm, apk)
+#   - with --ioc: web and PHP logs; with --containers: docker ps
+#
+# What it may change (only with --fix, --workarounds or --rollback, and only
+# after you answer y, or pass --yes):
+#   --fix          upgrades installed PHP packages with apt/dnf/yum/apk,
+#                  then restarts PHP-FPM / Apache so workers load the new code
+#   --workarounds  writes <php conf.d>/99-stacutis-php2shell.ini, adds a
+#                  marked block to vulnerable FPM pool files, and on mod_php
+#                  hosts writes stacutis-php2shell.conf in the Apache config
+#                  dir; backs up first to /var/backups/stacutis/<stamp>/ and
+#                  restarts the affected services
+#   --rollback     restores a backup made by --workarounds
+#   --log          appends one summary to /var/log/stacutis-php2shell.log
+#
+# What it never does: send data anywhere, phone home, add repositories,
+# compile PHP, or touch other hosts. The scan itself does not use the network.
+# --dry-run shows what a change would do without writing anything.
 #
 # Provided as-is. Run it only on systems you own or administer, and take
 # a backup before you answer yes to a change.
@@ -12,6 +32,8 @@
 # CVE-2026-109618  CVE-2026-109619
 # Fixed upstream: 8.5.12, 8.4.27, 8.3.36, 8.2.35
 # https://www.php.net/archive/2026.php#2026-10-21-5
+
+# --- settings and state (nothing below runs until main at the bottom) ---
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -116,7 +138,7 @@ WATCHED_IPS=(
 
 usage() {
   cat <<'EOF'
-stacutis-php2shell — local PHP2Shell scanner and patch helper
+stacutis-php2shell: local PHP2Shell scanner and patch helper
 
 Usage:
   stacutis-php2shell.sh [options]
@@ -637,7 +659,7 @@ explicit_off() {
   return 1
 }
 
-# --- os, packages, changelogs ---
+# --- os, packages, changelogs (read-only) ---
 
 parse_os_release() {
   local f line
@@ -865,7 +887,7 @@ pkg_of_path() {
   fi
 }
 
-# --- config ---
+# --- config parsing (read-only) ---
 
 list_ini_files() {
   local main=$1 dropin=$2
@@ -1212,7 +1234,7 @@ apache_conf_files() {
   done
 }
 
-# --- discovery ---
+# --- discovery: find every PHP install (read-only) ---
 
 reset_findings() {
   F_SAPI=()
@@ -1595,7 +1617,7 @@ needs_menu() {
   ((COUNT_VULN + COUNT_MIT > 0))
 }
 
-# --- IOC ---
+# --- IOC: optional log checks, --ioc only (read-only) ---
 
 append_cap() {
   local name=$1 value=$2
@@ -1887,7 +1909,7 @@ ioc_scan() {
   ioc_children_and_net
 }
 
-# --- containers ---
+# --- containers: optional, --containers only (read-only) ---
 
 scan_containers() {
   CONTAINER_NOTES=()
@@ -1954,7 +1976,7 @@ scan_containers() {
   fi
 }
 
-# --- report ---
+# --- report: print results, set exit code ---
 
 status_color() {
   case "$1" in
@@ -2216,7 +2238,7 @@ json_report() {
   printf '\n}\n'
 }
 
-# --- backup, restart, edits ---
+# --- backup, restart, edits: WRITES, only reached after a yes ---
 
 safe_logical_path() {
   case "$1" in
@@ -2827,7 +2849,7 @@ apply_workarounds() {
   return 0
 }
 
-# --- fix ---
+# --- fix: package upgrade, WRITES, only reached after a yes ---
 
 installed_packages_for_series() {
   local major=$1 minor=$2
