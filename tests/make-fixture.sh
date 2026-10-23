@@ -26,11 +26,17 @@ fixture_php_bin() {
   mkdir -p "$(dirname "$path")"
   cat >"$path" <<EOF
 #!/bin/sh
+# X-Powered-By: PHP/${ver}
 printf '%s\n' "PHP ${ver} (cli) (built: Jan  1 2026 00:00:00) ( NTS )"
 printf '%s\n' "Copyright (c) The PHP Group"
 exit 0
 EOF
   chmod 755 "$path"
+}
+
+# Marks a logical path as owned by a uid other than root.
+fixture_owner() {
+  printf '%s %s\n' "$2" "$3" >>"$1/fixture/owners"
 }
 
 fixture_add_pkg() {

@@ -740,6 +740,52 @@ if want "rhel-note"; then
   assert_rc "rhel layout vulnerable" 1
 fi
 
+if want "c1-backport-owner"; then
+  # A patched distro package must not vouch for an unpackaged binary.
+  root=$(fixture_new)
+  keep "$root"
+  fixture_php_bin "$root/usr/bin/php8.2" "8.2.7"
+  fixture_add_pkg "$root" "php8.2-cli" "8.2.7-1~deb12u9" "/usr/bin/php8.2"
+  fixture_changelog "$root" "php8.2-cli" <<'CL'
+php8.2 (8.2.7-1~deb12u9) bookworm-security; urgency=medium
+  * CVE-2026-109618
+  * CVE-2026-109619
+CL
+  fixture_php_bin "$root/usr/local/bin/php" "8.2.10"
+  run_tool --json --test-root "$root"
+  assert_eq "c1 distro build backported" "$(finding 8.2.7 cli | cut -f1)" "PATCHED"
+  assert_eq "c1 unpackaged build vulnerable" "$(finding 8.2.10 cli | cut -f1)" "VULNERABLE"
+  assert_rc "c1 scan" 1
+fi
+
+if want "c2-no-exec-untrusted"; then
+  root=$(fixture_new)
+  keep "$root"
+  mkdir -p "$root/home/mallory" "$root/proc/4242"
+  cat >"$root/home/mallory/php-fpm8.3" <<EOF2
+#!/bin/sh
+# X-Powered-By: PHP/8.3.1
+touch "$root/MARKER"
+printf 'PHP 9.9.9 (cli)\n'
+EOF2
+  chmod 755 "$root/home/mallory/php-fpm8.3"
+  fixture_owner "$root" "/home/mallory/php-fpm8.3" 1000
+  ln -s "/home/mallory/php-fpm8.3" "$root/proc/4242/exe"
+  mkdir -p "$root/usr/local/bin"
+  cat >"$root/usr/local/bin/php" <<EOF2
+#!/bin/sh
+# X-Powered-By: PHP/8.2.11
+touch "$root/MARKER2"
+printf 'PHP 9.9.9 (cli)\n'
+EOF2
+  chmod 775 "$root/usr/local/bin/php"
+  run_tool --json --test-root "$root"
+  [[ ! -e "$root/MARKER" ]] && pass "c2 proc exe not run" || fail "c2 proc exe not run"
+  [[ ! -e "$root/MARKER2" ]] && pass "c2 group-writable not run" || fail "c2 group-writable not run"
+  assert_eq "c2 static version from user binary" "$(finding 8.3.1 fpm | cut -f1)" "VULNERABLE"
+  assert_eq "c2 static version from writable binary" "$(finding 8.2.11 cli | cut -f1)" "VULNERABLE"
+fi
+
 host_log_after="absent"
 if [[ -e "$host_log" ]]; then
   host_log_after=$(cksum "$host_log" | awk '{print $1, $2}')

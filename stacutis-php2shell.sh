@@ -743,20 +743,81 @@ run_limited() {
   fi
 }
 
+# Owner uid of a path. In --test-root, fixture/owners can pretend a file
+# belongs to someone else ("<logical path> <uid>" per line).
+path_owner() {
+  local p=$1 logical line lp uid
+  if [[ -n "$TEST_ROOT" ]]; then
+    logical=${p#"$TEST_ROOT"}
+    if [[ -r "$TEST_ROOT/fixture/owners" ]]; then
+      while IFS=' ' read -r lp uid || [[ -n "$lp" ]]; do
+        if [[ "$lp" == "$logical" ]]; then
+          printf '%s\n' "$uid"
+          return 0
+        fi
+      done <"$TEST_ROOT/fixture/owners"
+    fi
+    printf '0\n'
+    return 0
+  fi
+  stat -c %u -- "$p" 2>/dev/null
+}
+
+# A binary is run (for -v) only when root owns it and nobody else can write
+# it or any directory above it. Anything else could be a planted program,
+# and this scan usually runs as root.
+trusted_to_run() {
+  local real d owner mode
+  real=$(readlink -f -- "$1" 2>/dev/null) || return 1
+  [[ -n "$real" && -f "$real" ]] || return 1
+  d=$real
+  while :; do
+    owner=$(path_owner "$d") || return 1
+    mode=$(stat -c %a -- "$d" 2>/dev/null) || return 1
+    [[ "$owner" == "0" ]] || return 1
+    if (( (8#$mode & 8#022) != 0 )); then
+      return 1
+    fi
+    if [[ "$d" == "/" || ( -n "$TEST_ROOT" && "$d" == "$TEST_ROOT" ) ]]; then
+      break
+    fi
+    d=$(dirname -- "$d")
+  done
+  return 0
+}
+
+# Read the version a PHP build carries without running it. PHP embeds
+# "X-Powered-By: PHP/<version>" in every SAPI binary and in libphp.so.
+static_php_version() {
+  local f=$1 hit
+  [[ -r "$f" ]] || return 1
+  hit=$(LC_ALL=C grep -aoE -m1 'X-Powered-By: PHP/[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.~+-]*' -- "$f" 2>/dev/null | head -n 1 || true)
+  [[ -n "$hit" ]] || return 1
+  printf 'PHP %s\n' "${hit#X-Powered-By: PHP/}"
+}
+
 php_version_text_of() {
   local bin=$1 out
-  out=$(run_limited "$bin" -v 2>&1 || true)
+  if ! trusted_to_run "$bin"; then
+    static_php_version "$bin" || true
+    return 0
+  fi
+  out=$(run_limited "$bin" -v 2>&1 </dev/null || true)
   if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
     printf '%s\n' "$out"
     return 0
   fi
-  out=$(run_limited "$bin" version 2>&1 || true)
+  out=$(run_limited "$bin" version 2>&1 </dev/null || true)
   if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
     printf '%s\n' "$out"
     return 0
   fi
-  out=$(run_limited "$bin" php-cli -v 2>&1 || true)
-  printf '%s\n' "$out"
+  out=$(run_limited "$bin" php-cli -v 2>&1 </dev/null || true)
+  if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  static_php_version "$bin" || printf '%s\n' "$out"
 }
 
 append_changelog_file() {
@@ -770,47 +831,27 @@ append_changelog_file() {
   printf '\n' >>"$dest"
 }
 
+# Changelog evidence comes only from the package that owns the binary being
+# classified. A changelog from another package in the same series says
+# nothing about a hand-built or leftover binary.
 collect_changelog_text() {
   local major=$1 minor=$2 pkg=$3 dest=$4
-  local dotted="${major}.${minor}" compact="${major}${minor}"
-  local base dir doc rp
+  local rp
   : >"$dest"
-  if [[ -n "$pkg" && "$pkg" != "unknown" ]]; then
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog.Debian.gz")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog.Debian")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/fixture/changelogs/${pkg}")
-    append_changelog_file "$rp" "$dest"
-  fi
-  dir=$(rootp /usr/share/doc)
-  if [[ -d "$dir" ]]; then
-    for base in "$dir"/*; do
-      [[ -d "$base" ]] || continue
-      local name
-      name=$(basename "$base")
-      case "$name" in
-        "php${dotted}"|"php${dotted}-"*|"php${compact}"|"php${compact}-"*|"php-${dotted}"|"php-${dotted}-"*)
-          for doc in "$base"/changelog.Debian.gz "$base"/changelog.Debian "$base"/changelog "$base"/changelog.gz; do
-            append_changelog_file "$doc" "$dest"
-          done
-          ;;
-      esac
-    done
-  fi
-  if [[ -z "$TEST_ROOT" && -n "$pkg" && "$pkg" != "unknown" ]]; then
-    if command -v rpm >/dev/null 2>&1; then
-      rpm -q --changelog "$pkg" >>"$dest" 2>/dev/null || true
-    fi
+  [[ -n "$pkg" && "$pkg" != "unknown" ]] || return 0
+  for rp in "/usr/share/doc/${pkg}/changelog.Debian.gz" "/usr/share/doc/${pkg}/changelog.Debian" \
+    "/usr/share/doc/${pkg}/changelog.gz" "/usr/share/doc/${pkg}/changelog" "/fixture/changelogs/${pkg}"; do
+    append_changelog_file "$(rootp "$rp")" "$dest"
+  done
+  if [[ -z "$TEST_ROOT" ]] && command -v rpm >/dev/null 2>&1; then
+    rpm -q --changelog "$pkg" >>"$dest" 2>/dev/null || true
   fi
 }
 
 backport_state_for() {
   local major=$1 minor=$2 pkg=$3
   local tmp state
-  if [[ -z "$major" || -z "$minor" ]]; then
+  if [[ -z "$major" || -z "$minor" || -z "$pkg" || "$pkg" == "unknown" ]]; then
     printf '%s\n' "unchecked"
     return 0
   fi
@@ -1341,8 +1382,11 @@ consider_file() {
   SEEN+=("$key")
 
   local vertext="" version="" pre=0 raw="" major="" minor="" pkg="" pkgver="" back="unchecked"
-  local drop="" main="" pools="" note=""
+  local drop="" main="" pools="" note="${2:-}"
   if [[ "$kind" != "modphp" ]]; then
+    if ! trusted_to_run "$path"; then
+      note="${note} Not run: root does not own it, or others can write it or a directory above it. Version read from the file."
+    fi
     vertext=$(php_version_text_of "$path")
     parse_php_version_text "$vertext"
     if [[ "$PARSED_OK" -eq 1 ]]; then
@@ -1359,7 +1403,10 @@ consider_file() {
       minor=$SERIES_MINOR
     fi
   fi
-  pkg_of_path "$path"
+  pkg_of_path "$real"
+  if [[ -z "$FOUND_PKG" && "$real" != "$path" ]]; then
+    pkg_of_path "$path"
+  fi
   pkg=$FOUND_PKG
   pkgver=$FOUND_PKGVER
   if [[ -z "$version" && -n "$pkgver" ]]; then
@@ -1391,7 +1438,7 @@ consider_file() {
       fi
     fi
   else
-    note="series not identified."
+    note="${note} series not identified."
   fi
   if [[ "$kind" == "modphp" ]]; then
     MOD_PHP=1
@@ -1489,68 +1536,67 @@ load_apache_modules() {
   fi
 }
 
+# Running PHP processes. Their binaries are never run from /proc: a process
+# can belong to any user. A live file on disk goes through consider_file,
+# which runs it only when it is root-only. A deleted binary is read in
+# place for its version string and reported as its own finding, because the
+# code in memory is no longer the file on disk.
 discover_procs() {
-  local procroot pid dir exe raw deleted base kind
+  local procroot pid dir raw deleted base kind key i real
   procroot=$(rootp /proc)
   [[ -d "$procroot" ]] || return 0
   for dir in "$procroot"/[0-9]*; do
     [[ -d "$dir" ]] || continue
     pid=$(basename "$dir")
-    [[ -r "$dir/exe" || -L "$dir/exe" ]] || continue
     raw=$(readlink "$dir/exe" 2>/dev/null || true)
     [[ -n "$raw" ]] || continue
     deleted=0
     if [[ "$raw" == *" (deleted)" ]]; then
       deleted=1
-      ANY_RUNNING_DELETED=1
       raw=${raw%" (deleted)"}
     fi
     base=$(basename "$raw")
     kind=$(php_binary_kind "$base")
     [[ -n "$kind" ]] || continue
-    local key="${kind}|${raw}"
-    if seen_key "$key"; then
-      if [[ "$deleted" -eq 1 ]]; then
-        local i
-        for i in "${!F_PATH[@]}"; do
-          if [[ "${F_PATH[i]}" == "$raw" || "$(readlink -f "${F_PATH[i]}" 2>/dev/null || true)" == "$raw" ]]; then
-            F_DELETED[i]=1
-            F_NOTE[i]="${F_NOTE[i]} running process ${pid} is mapped to a deleted binary."
-          fi
-        done
+    if [[ "$deleted" -eq 0 ]]; then
+      local phys
+      phys=$(rootp "$raw")
+      real=$(readlink -f "$phys" 2>/dev/null || true)
+      key="${kind}|${real:-$phys}"
+      if ! seen_key "$key" && [[ -e "$phys" ]]; then
+        consider_file "$phys" "seen as pid ${pid}."
       fi
       continue
     fi
-    local vertext="" version="" pre=0
-    if [[ -x "$dir/exe" ]]; then
-      vertext=$(php_version_text_of "$dir/exe")
-      parse_php_version_text "$vertext"
-      if [[ "$PARSED_OK" -eq 1 ]]; then
-        version=$PARSED_TRIPLE
-        pre=$PARSED_PRE
+    ANY_RUNNING_DELETED=1
+    for i in "${!F_PATH[@]}"; do
+      if [[ "${F_PATH[i]}" == "$raw" || "$(readlink -f "${F_PATH[i]}" 2>/dev/null || true)" == "$raw" ]]; then
+        F_DELETED[i]=1
+        F_NOTE[i]="${F_NOTE[i]} running process ${pid} is mapped to a deleted binary."
       fi
-    fi
-    local major="" minor="" back="unchecked" drop="" main="" pools="" note="seen as pid ${pid}."
-    if [[ -n "$version" ]]; then
+    done
+    key="deleted|${kind}|${raw}"
+    seen_key "$key" && continue
+    SEEN+=("$key")
+    local vertext="" version="" pre=0 major="" minor="" drop="" main=""
+    local note="pid ${pid} runs a deleted binary. Version read from memory without running it. Restart the service."
+    vertext=$(static_php_version "$dir/exe" || true)
+    parse_php_version_text "$vertext"
+    if [[ -n "$vertext" && "$PARSED_OK" -eq 1 ]]; then
+      version=$PARSED_TRIPLE
+      pre=$PARSED_PRE
       major=$PARSED_MAJOR
       minor=$PARSED_MINOR
     elif series_from_basename "$base"; then
       major=$SERIES_MAJOR
       minor=$SERIES_MINOR
     fi
-    if [[ "$deleted" -eq 1 ]]; then
-      note="${note} binary deleted."
+    if [[ -n "$major" ]] && locate_layout "$major" "$minor" "$kind"; then
+      main=$LOC_MAIN
+      drop=$LOC_DROPIN
     fi
-    if [[ -n "$major" ]]; then
-      back=$(backport_state_for "$major" "$minor" "")
-      if locate_layout "$major" "$minor" "$kind"; then
-        main=$LOC_MAIN
-        drop=$LOC_DROPIN
-      fi
-    fi
-    SEEN+=("$key")
-    add_raw "$kind" "$raw" "$version" "$pre" "$vertext" "unknown" "" "$back" \
-      "$(risk_for "$kind")" "$drop" "$main" "$pools" "$deleted" "$note"
+    add_raw "$kind" "${raw} (deleted, pid ${pid})" "$version" "$pre" "$vertext" "unknown" "" "unchecked" \
+      "$(risk_for "$kind")" "$drop" "$main" "" "1" "$note"
   done
 }
 
