@@ -948,6 +948,50 @@ EOF2
 fi
 
 host_log_after="absent"
+if want "l2-idempotent-block"; then
+  root=$(vuln_fpm)
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  f=$(find "$root/etc" -name '99-stacutis-php2shell.ini' | head -1)
+  a=$(cksum <"$f")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_eq "l2 repeated runs give the same file" "$(cksum <"$f")" "$a"
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  b=$(grep -c '^$' "$pool")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_eq "l2 pool blank lines do not grow" "$(grep -c '^$' "$pool")" "$b"
+fi
+
+if want "l3-json-control"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^json_escape()/,/^}/p' "$SCRIPT")
+  assert_eq "l3 control chars escaped" "$(json_escape $'a\x01b\x1bc')" 'a\u0001b\u001bc'
+  if command -v python3 >/dev/null 2>&1; then
+    printf '"%s"' "$(json_escape $'x\x02\ty"\\')" | python3 -c 'import json,sys; json.load(sys.stdin)' && pass "l3 valid json" || fail "l3 valid json"
+  fi
+fi
+
+if want "l5-ini-sections"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^ini_key_value()/,/^}/p' "$SCRIPT")
+  ini=$(mktemp)
+  printf 'a = 1\nb = "x;y" ; note\nc =\n[PATH=/var/www]\na = 9\n[PHP]\nd = 4 ; c\n' >"$ini"
+  ini_key_value a "$ini"; assert_eq "l5 PATH section ignored" "$INI_VALUE" "1"
+  ini_key_value b "$ini"; assert_eq "l5 quoted semicolon kept" "$INI_VALUE" "x;y"
+  ini_key_value c "$ini"; assert_eq "l5 empty value found" "$INI_FOUND:$INI_VALUE" "1:"
+  ini_key_value d "$ini"; assert_eq "l5 inline comment stripped" "$INI_VALUE" "4"
+  rm -f "$ini"
+fi
+
+if want "l1-nonroot-warning"; then
+  if [[ "$(id -u)" -ne 0 ]]; then
+    out=$(bash "$SCRIPT" --json 2>&1 >/dev/null || true)
+    [[ "$out" == *"not running as root"* ]] && pass "l1 warning shown" || fail "l1 warning shown"
+  else
+    pass "l1 skipped as root"
+  fi
+fi
+
 if [[ -e "$host_log" ]]; then
   host_log_after=$(cksum "$host_log" | awk '{print $1, $2}')
 fi

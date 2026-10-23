@@ -332,6 +332,17 @@ json_escape() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
+  if [[ "$s" == *[$'\x01'-$'\x1f'$'\x7f']* ]]; then
+    local out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+      c=${s:i:1}
+      case "$c" in
+        [$'\x01'-$'\x1f'$'\x7f']) printf -v c '\\u%04x' "'$c" ;;
+      esac
+      out+=$c
+    done
+    s=$out
+  fi
   printf '%s' "$s"
 }
 
@@ -976,23 +987,40 @@ list_ini_files() {
 ini_key_value() {
   local key=$1
   shift
-  local f line k v val found=0
+  local f line k v val found=0 scoped
   INI_FOUND=0
   INI_VALUE=""
   for f in "$@"; do
     [[ -f "$f" && -r "$f" ]] || continue
+    scoped=0
     while IFS= read -r line || [[ -n "$line" ]]; do
-      line=${line%%;*}
-      line=$(trim "$line")
-      [[ -z "$line" ]] && continue
-      [[ "$line" == \[* ]] && continue
+      # Inline trim: no subshell per line.
+      line=${line#"${line%%[![:space:]]*}"}
+      [[ -z "$line" || "$line" == \;* ]] && continue
+      if [[ "$line" == \[* ]]; then
+        # [PATH=...] and [HOST=...] apply only to some requests.
+        case "${line^^}" in
+          "[PATH="*|"[HOST="*) scoped=1 ;;
+          *) scoped=0 ;;
+        esac
+        continue
+      fi
+      [[ "$scoped" -eq 1 ]] && continue
       [[ "$line" == *"="* ]] || continue
-      k=$(trim "${line%%=*}")
-      v=$(trim "${line#*=}")
-      v=${v#\"}
-      v=${v%\"}
-      v=${v#\'}
-      v=${v%\'}
+      k=${line%%=*}
+      k=${k%"${k##*[![:space:]]}"}
+      v=${line#*=}
+      v=${v#"${v%%[![:space:]]*}"}
+      if [[ "$v" == \"* ]]; then
+        v=${v#\"}
+        v=${v%%\"*}
+      elif [[ "$v" == \'* ]]; then
+        v=${v#\'}
+        v=${v%%\'*}
+      else
+        v=${v%%;*}
+        v=${v%"${v##*[![:space:]]}"}
+      fi
       if [[ "$k" == "$key" ]]; then
         val=$v
         found=1
@@ -2871,7 +2899,8 @@ EOF2
       $0 == b {skip=1; next}
       $0 == e {skip=0; next}
       skip == 1 {next}
-      {print}
+      /^[[:space:]]*$/ {blank++; next}
+      {while (blank > 0) {print ""; blank--}; print}
     ' "$path" >"$tmp"; then
       rm -f "$tmp"
       err "could not read ${logical}"
@@ -2880,8 +2909,10 @@ EOF2
   else
     record_created "$logical" || { rm -f "$tmp"; return 1; }
   fi
+  local sep=""
+  [[ -s "$tmp" ]] && sep=$'\n'
   if ! {
-    printf '\n%s\n' "$begin"
+    printf '%s%s\n' "$sep" "$begin"
     printf '%s\n' "$block"
     printf '%s\n' "$end"
   } >>"$tmp"; then
@@ -2970,14 +3001,18 @@ inject_pool_file() {
   blockfile=$(tmpfile) || { rm -f "$tmp" "$stripped"; return 1; }
   printf '%s\n' "$block" >"$blockfile"
   if ! awk -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" -v limit="$DO_MAX_REQUESTS" '
-    $0 == b {skip=1; next}
+    function flush() { while (blank > 0) { print ""; blank-- } }
+    $0 == b {skip=1; blank=0; next}
     $0 == e {skip=0; next}
     skip == 1 {next}
+    /^[[:space:]]*$/ {blank++; next}
     limit == 1 && $0 ~ /^[[:space:]]*pm\.max_requests[[:space:]]*=/ {
+      flush()
       print "; stacutis-php2shell previous: " $0
       next
     }
-    {print}
+    {flush(); print}
+    END {flush()}
   ' "$path" >"$stripped"; then
     rm -f "$tmp" "$stripped" "$blockfile"
     err "could not read ${logical}"
@@ -3898,6 +3933,9 @@ main() {
   parse_args "$@"
   setup_colors
   stale_data_warning
+  if [[ -z "$TEST_ROOT" && "$(id -u)" -ne 0 ]]; then
+    warn "not running as root: some files and /proc entries may be unreadable, so results can be UNKNOWN or incomplete."
+  fi
   if [[ "$LOG_FOR_SCAN" -eq 1 ]]; then
     DO_LOG=1
   fi
