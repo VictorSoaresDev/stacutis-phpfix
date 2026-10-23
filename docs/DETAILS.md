@@ -95,3 +95,15 @@ Exit 0 does not mean the host was checked for a past break-in.
 `bash tests/run-hermetic.sh` runs the fixture suite. The Docker image suite was not executed in the environment that produced this tree.
 
 Sources: [PHP 21 October 2026 release](https://www.php.net/archive/2026.php#2026-10-21-5), [PHP Foundation](https://thephp.foundation/blog/2026/10/21/todays-php-security-release-and-how-were-strengthening-php-security/), [oss-security](https://openwall.com/lists/oss-security/2026/10/21/6), [CERT-EU 2026-018](https://www.cert.europa.eu/publications/security-advisories/2026-018/), [Canadian Centre AL26-026](https://www.cyber.gc.ca/en/alerts-advisories/al26-026-critical-vulnerabilities-impacting-php-cve-2026-109618-cve-2026-109619), [AWS MadPot](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/), [AWS WAF](https://aws.amazon.com/blogs/security/using-aws-waf-to-apply-mitigations-for-php2shell-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619/).
+
+## Coverage and safety details
+
+- Layouts: distro packages, php.net Docker images, /usr/local builds, cPanel EasyApache (ea-php), Plesk (/opt/plesk/php) and CloudLinux alt-php (/opt/alt). For a trusted CLI on a live host, `php --ini` is used to find the ini files.
+- Ini files in conf.d are followed through symlinks. Paths with `..` are rejected.
+- Apache: only enabled config files are read. The workaround block covers both `php_module` and `php7_module`.
+- If the package changelog is not installed, the result says so ("changelog-not-installed") instead of guessing.
+- Held packages (apt-mark hold, dnf versionlock) are reported and skipped by `--fix`.
+- `--fix` restarts only the services for the PHP branches that are vulnerable.
+- The changelog server sometimes returns 404 for new security uploads. In that case the candidate cannot be confirmed and the script says so. It does not upgrade on a guess.
+- IOC checks: crash lines and journal timestamps only, access logs are streamed, and only outbound connections from PHP processes are listed.
+- Containers: docker and podman. `--containers-exec` probes every running container; without it only PHP-named containers are listed.
