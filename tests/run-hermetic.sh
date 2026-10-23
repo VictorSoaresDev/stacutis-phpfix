@@ -786,6 +786,78 @@ EOF2
   assert_eq "c2 static version from writable binary" "$(finding 8.2.11 cli | cut -f1)" "VULNERABLE"
 fi
 
+if want "h1-write-failure"; then
+  root=$(vuln_fpm)
+  confd="$root/etc/php/8.3/fpm/conf.d"
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  before=$(cksum <"$pool")
+  chmod 555 "$confd"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  chmod 755 "$confd"
+  assert_rc "h1 failed write" 4
+  [[ ! -e "$root/fixture/restarts.log" ]] && pass "h1 no restart after failed write" || fail "h1 no restart after failed write"
+  assert_eq "h1 pool untouched" "$(cksum <"$pool")" "$before"
+  [[ ! -e "$confd/99-stacutis-php2shell.ini" ]] && pass "h1 no drop-in left" || fail "h1 no drop-in left"
+fi
+
+if want "h2-configtest"; then
+  root=$(vuln_fpm)
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  before=$(cksum <"$pool")
+  printf 'ERROR: unknown entry\n' >"$root/fixture/configtest-fail"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_rc "h2 config test failure" 4
+  [[ ! -e "$root/fixture/restarts.log" ]] && pass "h2 no restart on bad config" || fail "h2 no restart on bad config"
+  assert_eq "h2 pool restored" "$(cksum <"$pool")" "$before"
+  [[ ! -e "$root/etc/php/8.3/fpm/conf.d/99-stacutis-php2shell.ini" ]] && pass "h2 drop-in removed" || fail "h2 drop-in removed"
+  grep -q 'test-root reload' "$RUN_ERR" "$RUN_OUT" && fail "h2 reload happened" || pass "h2 nothing reloaded"
+fi
+
+if want "h3-symlink-dropin"; then
+  root=$(vuln_fpm)
+  confd="$root/etc/php/8.3/fpm/conf.d"
+  mkdir -p "$root/etc/php/8.3/mods-available"
+  printf '; old\n' >"$root/etc/php/8.3/mods-available/stacutis.ini"
+  chmod 640 "$root/etc/php/8.3/mods-available/stacutis.ini"
+  ln -s ../../mods-available/stacutis.ini "$confd/99-stacutis-php2shell.ini"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  [[ -L "$confd/99-stacutis-php2shell.ini" ]] && pass "h3 symlink kept" || fail "h3 symlink kept"
+  grep -q 'session.upload_progress.enabled = 0' "$root/etc/php/8.3/mods-available/stacutis.ini" && pass "h3 target written" || fail "h3 target written"
+  assert_eq "h3 mode kept" "$(stat -c %a "$root/etc/php/8.3/mods-available/stacutis.ini")" "640"
+  leftover=$(find "$root/etc" -name '.stacutis-php2shell.*' | head -1)
+  assert_eq "h3 no temp files left" "$leftover" ""
+fi
+
+if want "h4-unique-stamp"; then
+  root=$(vuln_fpm)
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  orig=$(cksum <"$pool")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  n=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  assert_eq "h4 three runs three backups" "$n" "3"
+  first=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | head -1)
+  run_tool --rollback "$first" --yes --test-root "$root"
+  assert_eq "h4 first rollback gives the original pool" "$(cksum <"$pool")" "$orig"
+fi
+
+if want "h5-other-namespace"; then
+  root=$(vuln_fpm)
+  mkdir -p "$root/proc/self/ns" "$root/proc/77/ns" "$root/proc/78/ns"
+  ln -s 'mnt:[4026531840]' "$root/proc/self/ns/mnt"
+  ln -s 'mnt:[4026532999]' "$root/proc/77/ns/mnt"
+  ln -s /usr/local/sbin/php-fpm "$root/proc/77/exe"
+  ln -s 'mnt:[4026531840]' "$root/proc/78/ns/mnt"
+  ln -s /usr/sbin/php-fpm8.3 "$root/proc/78/exe"
+  run_tool --json --test-root "$root"
+  assert_rc "h5 host scan" 1
+  n=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["other_namespace_processes"]), len(d["findings"]))' "$RUN_OUT")
+  assert_eq "h5 one foreign process, one host finding" "$n" "1 1"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  [[ ! -e "$root/usr/local/etc/php-fpm.d/99-stacutis-php2shell.ini" ]] && pass "h5 foreign not changed" || fail "h5 foreign not changed"
+fi
+
 host_log_after="absent"
 if [[ -e "$host_log" ]]; then
   host_log_after=$(cksum "$host_log" | awk '{print $1, $2}')

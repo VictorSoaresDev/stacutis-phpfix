@@ -284,7 +284,7 @@ tradeoff() {
 }
 
 workaround_banner() {
-  local line="${RED}${BOLD}These settings leave the vulnerable PHP installed. MITIGATED is still vulnerable. PHP restarts and drops requests in flight.${RESET}"
+  local line="${RED}${BOLD}These settings leave the vulnerable PHP installed. MITIGATED is still vulnerable. The config is tested first, then PHP is reloaded. If a reload is not possible it restarts, which drops requests in flight.${RESET}"
   if [[ "$JSON" -eq 1 || "$QUIET" -eq 1 ]]; then
     printf '%s\n' "$line" >&2
     return 0
@@ -458,7 +458,7 @@ parse_args() {
       die_usage "post-size, memory, and max-requests flags belong with --workarounds"
     fi
   fi
-  if [[ -n "$ROLLBACK" && ! "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+  if [[ -n "$ROLLBACK" && ! "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]]; then
     die_usage "--rollback timestamp must look like 20261022T153000Z"
   fi
   if [[ -n "$TEST_ROOT" ]]; then
@@ -1278,6 +1278,7 @@ apache_conf_files() {
 # --- discovery: find every PHP install (read-only) ---
 
 reset_findings() {
+  OTHER_NS=()
   F_SAPI=()
   F_PATH=()
   F_VERSION=()
@@ -1536,6 +1537,31 @@ load_apache_modules() {
   fi
 }
 
+# True when two paths are the same file (same device and inode).
+same_file() {
+  local a b
+  a=$(stat -L -c '%d:%i' "$1" 2>/dev/null) || return 1
+  b=$(stat -L -c '%d:%i' "$2" 2>/dev/null) || return 1
+  [[ "$a" == "$b" ]]
+}
+
+# A PHP process in another mount namespace, usually a container. Its path
+# means nothing on the host, so it is only reported, never changed.
+record_other_ns() {
+  local pid=$1 path=$2 exe=$3 text ver="" status="UNKNOWN" fixed
+  text=$(static_php_version "$exe" || true)
+  parse_php_version_text "$text"
+  if [[ -n "$text" && "$PARSED_OK" -eq 1 ]]; then
+    ver=$PARSED_TRIPLE
+    if fixed=$(fixed_triple "$PARSED_MAJOR" "$PARSED_MINOR") && version_ge "$PARSED_TRIPLE" "$fixed"; then
+      status="PATCHED"
+    else
+      status="BELOW_FIX"
+    fi
+  fi
+  OTHER_NS+=("${pid}"$'\t'"${path}"$'\t'"${ver:-unknown}"$'\t'"${status}")
+}
+
 # Running PHP processes. Their binaries are never run from /proc: a process
 # can belong to any user. A live file on disk goes through consider_file,
 # which runs it only when it is root-only. A deleted binary is read in
@@ -1545,6 +1571,8 @@ discover_procs() {
   local procroot pid dir raw deleted base kind key i real
   procroot=$(rootp /proc)
   [[ -d "$procroot" ]] || return 0
+  local self_ns ns
+  self_ns=$(readlink "$procroot/self/ns/mnt" 2>/dev/null || true)
   for dir in "$procroot"/[0-9]*; do
     [[ -d "$dir" ]] || continue
     pid=$(basename "$dir")
@@ -1558,6 +1586,11 @@ discover_procs() {
     base=$(basename "$raw")
     kind=$(php_binary_kind "$base")
     [[ -n "$kind" ]] || continue
+    ns=$(readlink "$dir/ns/mnt" 2>/dev/null || true)
+    if [[ -n "$self_ns" && -n "$ns" && "$ns" != "$self_ns" ]] && ! same_file "$dir/exe" "$(rootp "$raw")"; then
+      record_other_ns "$pid" "$raw" "$dir/exe"
+      continue
+    fi
     if [[ "$deleted" -eq 0 ]]; then
       local phys
       phys=$(rootp "$raw")
@@ -1649,7 +1682,13 @@ count_status() {
 
 scan_code() {
   count_status
-  if ((COUNT_VULN + COUNT_MIT > 0)); then
+  local orow other_below=0
+  if [[ "$DO_CONTAINERS" -eq 1 ]]; then
+    for orow in "${OTHER_NS[@]+"${OTHER_NS[@]}"}"; do
+      [[ "$orow" == *$'\t'BELOW_FIX ]] && other_below=1
+    done
+  fi
+  if ((COUNT_VULN + COUNT_MIT + other_below > 0)); then
     printf '%s\n' "1"
   elif ((COUNT_UNK > 0)); then
     printf '%s\n' "3"
@@ -2170,6 +2209,18 @@ human_report() {
       printf '  note: %s\n' "$item"
     done
   fi
+  if [[ ${#OTHER_NS[@]} -gt 0 ]]; then
+    printf '\n%sPHP running in containers or other namespaces%s\n' "$BOLD" "$RESET"
+    local orow opid opath over ostat
+    for orow in "${OTHER_NS[@]}"; do
+      IFS=$'\t' read -r opid opath over ostat <<<"$orow"
+      printf '  pid %s  %s  PHP %s  %s\n' "$opid" "$opath" "$over" "$ostat"
+    done
+    printf '  These are not changed by --fix or --workarounds. BELOW_FIX means the\n'
+    printf '  upstream version is older than the fix. A distro build inside may still\n'
+    printf '  carry a backport. Check or rebuild the image. They set the exit code\n'
+    printf '  only with --containers.\n'
+  fi
   if [[ "$DO_CONTAINERS" -eq 1 ]]; then
     printf '\n%sContainers%s\n' "$BOLD" "$RESET"
     local row
@@ -2277,6 +2328,16 @@ json_report() {
   else
     printf '  "containers": null,\n'
   fi
+  printf '  "other_namespace_processes": ['
+  local ofirst=1 orow opid opath over ostat
+  for orow in "${OTHER_NS[@]+"${OTHER_NS[@]}"}"; do
+    IFS=$'\t' read -r opid opath over ostat <<<"$orow"
+    if [[ "$ofirst" -eq 0 ]]; then printf ', '; fi
+    ofirst=0
+    printf '{"pid": %s, "path": %s, "version": %s, "status": %s}' "$(json_string "$opid")" \
+      "$(json_string "$opath")" "$(json_string "$over")" "$(json_string "$ostat")"
+  done
+  printf '],\n'
   printf '  "warnings": '
   json_array_strings "${WARNINGS[@]+"${WARNINGS[@]}"}"
   printf ',\n  "actions": '
@@ -2294,7 +2355,13 @@ safe_logical_path() {
 }
 
 begin_backup() {
-  BACKUP_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+  local base n=0
+  base=$(date -u +%Y%m%dT%H%M%SZ)
+  BACKUP_STAMP=$base
+  while [[ -e "$(rootp "/var/backups/stacutis/${BACKUP_STAMP}")" ]]; do
+    n=$((n + 1))
+    BACKUP_STAMP="${base}-${n}"
+  done
   BACKUP_DIR=$(rootp "/var/backups/stacutis/${BACKUP_STAMP}")
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: would create ${BACKUP_DIR}"
@@ -2302,16 +2369,23 @@ begin_backup() {
   fi
   local parent
   parent=$(dirname "$BACKUP_DIR")
-  mkdir -p "$parent"
+  mkdir -p "$parent" || { err "could not create ${parent}"; return 1; }
   chmod 700 "$parent" 2>/dev/null || true
-  mkdir -m 700 "$BACKUP_DIR"
-  mkdir -m 700 "$BACKUP_DIR/files"
-  {
+  # mkdir without -p fails if another run took the same name in the meantime.
+  if ! mkdir -m 700 "$BACKUP_DIR" || ! mkdir -m 700 "$BACKUP_DIR/files"; then
+    err "could not create a new backup directory ${BACKUP_DIR}"
+    BACKUP_DIR=""
+    return 1
+  fi
+  if ! {
     printf 'STACUTIS_BACKUP 1\n'
     printf 'STAMP %s\n' "$BACKUP_STAMP"
     printf 'PM %s\n' "$PM"
     printf 'TOOL %s\n' "$TOOL_VERSION"
-  } >"$BACKUP_DIR/manifest"
+  } >"$BACKUP_DIR/manifest"; then
+    err "could not write ${BACKUP_DIR}/manifest"
+    return 1
+  fi
   note_action "backup ${BACKUP_STAMP} at ${BACKUP_DIR}"
 }
 
@@ -2326,8 +2400,8 @@ seal_backup() {
 backup_existing() {
   local logical=$1 src dest
   safe_logical_path "$logical" || {
-    warn "refusing to back up path outside config roots: $logical"
-    return 0
+    err "refusing to back up path outside config roots: $logical"
+    return 1
   }
   src=$(rootp "$logical")
   [[ -e "$src" ]] || return 0
@@ -2335,10 +2409,137 @@ backup_existing() {
     say "dry-run: would back up ${logical}"
     return 0
   fi
+  # Keep the first copy. A second backup in the same run would save our own edit.
+  if grep -qxF "EXISTING ${logical}" "$BACKUP_DIR/manifest" 2>/dev/null; then
+    return 0
+  fi
   dest="${BACKUP_DIR}/files${logical}"
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$src" "$dest"
-  printf 'EXISTING %s\n' "$logical" >>"$BACKUP_DIR/manifest"
+  if ! mkdir -p "$(dirname "$dest")" || ! cp -a "$src" "$dest"; then
+    err "could not back up ${logical}"
+    return 1
+  fi
+  printf 'EXISTING %s\n' "$logical" >>"$BACKUP_DIR/manifest" || return 1
+}
+
+# Puts a finished temp file in place. The temp file lives in the same
+# directory, so the rename is atomic. It keeps owner, group and mode of the
+# file it replaces and restores the SELinux label when restorecon exists.
+install_tmp() {
+  local tmp=$1 path=$2
+  if [[ -e "$path" ]]; then
+    chmod --reference="$path" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    chown --reference="$path" "$tmp" 2>/dev/null || true
+  else
+    chmod 644 "$tmp"
+  fi
+  if ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    err "could not write ${path}"
+    return 1
+  fi
+  if [[ -z "$TEST_ROOT" ]] && command -v restorecon >/dev/null 2>&1; then
+    restorecon "$path" 2>/dev/null || true
+  fi
+  return 0
+}
+
+new_tmp_beside() {
+  mktemp "$(dirname "$1")/.stacutis-php2shell.XXXXXX" 2>/dev/null || {
+    err "could not create a temp file next to $1"
+    return 1
+  }
+}
+
+# Undo this run's edits from its own backup: remove files it created and put
+# back files it changed. Used by --rollback and after a failed write or a
+# failed config test.
+restore_backup_files() {
+  local dir=$1 kind path src dest bad=0
+  while IFS=' ' read -r kind path _; do
+    [[ "$kind" == "CREATED" ]] || continue
+    case "$(basename "$path")" in
+      *stacutis-php2shell*) ;;
+      *)
+        err "manifest contains an unexpected created path: $path"
+        return 4
+        ;;
+    esac
+    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
+    rm -f "$(rootp "$path")" || bad=1
+    note_action "removed ${path}"
+  done <"$dir/manifest"
+  while IFS=' ' read -r kind path _; do
+    [[ "$kind" == "EXISTING" ]] || continue
+    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
+    src="${dir}/files${path}"
+    dest=$(rootp "$path")
+    if [[ ! -e "$src" ]]; then
+      err "backup is missing ${src}"
+      return 4
+    fi
+    if [[ -d "$dest" && ! -L "$dest" ]]; then
+      err "refusing to replace directory ${path}"
+      return 4
+    fi
+    if mkdir -p "$(dirname "$dest")" && rm -f "$dest" && cp -a "$src" "$dest"; then
+      note_action "restored ${path}"
+    else
+      err "could not restore ${path}"
+      bad=1
+    fi
+  done <"$dir/manifest"
+  [[ "$bad" -eq 0 ]] || return 4
+  return 0
+}
+
+# Runs the services' own config checks before any restart. A broken config
+# must not take the site down. Binaries are run only when trusted_to_run.
+config_tests_pass() {
+  if [[ -n "$TEST_ROOT" ]]; then
+    if [[ -e "$(rootp /fixture/configtest-fail)" ]]; then
+      err "config test failed: $(cat "$(rootp /fixture/configtest-fail)")"
+      return 1
+    fi
+    return 0
+  fi
+  local i bin outp seen=$'\n' failed=0 c
+  for i in "${!F_SAPI[@]}"; do
+    [[ "${F_SAPI[i]}" == "fpm" ]] || continue
+    bin=${F_PATH[i]}
+    [[ "$bin" == *" (deleted"* || ! -x "$bin" ]] && continue
+    [[ "$seen" == *$'\n'"$bin"$'\n'* ]] && continue
+    seen="${seen}${bin}"$'\n'
+    trusted_to_run "$bin" || continue
+    if ! outp=$("$bin" -t 2>&1 </dev/null); then
+      err "config test failed for ${bin}:"
+      printf '%s\n' "$outp" | tail -n 5 >&2
+      failed=1
+    fi
+  done
+  if [[ -d /etc/apache2 || -d /etc/httpd ]]; then
+    for c in apache2ctl apachectl httpd; do
+      command -v "$c" >/dev/null 2>&1 || continue
+      if ! outp=$("$c" -t 2>&1 </dev/null); then
+        err "Apache config test failed (${c} -t):"
+        printf '%s\n' "$outp" | tail -n 5 >&2
+        failed=1
+      fi
+      break
+    done
+  fi
+  return "$failed"
+}
+
+# After a failed write or config test: put the old files back and do not
+# restart anything.
+undo_run_edits() {
+  [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/manifest" ]] || return 1
+  if restore_backup_files "$BACKUP_DIR"; then
+    say "Restored the previous config files from ${BACKUP_STAMP}. No service was restarted."
+    return 0
+  fi
+  err "could not fully restore from ${BACKUP_DIR}. Run --rollback ${BACKUP_STAMP} after fixing the cause."
+  return 1
 }
 
 record_created() {
@@ -2433,8 +2634,10 @@ web_sapi_present() {
   return 1
 }
 
+# restart_one SERVICE [restart|reload]. A reload is enough after a config-only
+# change and keeps requests in flight. It falls back to a restart.
 restart_one() {
-  local svc=$1
+  local svc=$1 action=${2:-restart}
   record_service "$svc"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
@@ -2442,11 +2645,16 @@ restart_one() {
   if [[ -n "$TEST_ROOT" ]]; then
     mkdir -p "$(rootp /fixture)"
     printf '%s\n' "$svc" >>"$(rootp /fixture/restarts.log)"
-    note_action "test-root restart ${svc}"
+    note_action "test-root ${action} ${svc}"
     RESTARTS_DONE=$((RESTARTS_DONE + 1))
     return 0
   fi
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if [[ "$action" == "reload" ]] && systemctl reload "$svc"; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if systemctl restart "$svc"; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2454,6 +2662,11 @@ restart_one() {
     fi
   fi
   if command -v rc-service >/dev/null 2>&1; then
+    if [[ "$action" == "reload" ]] && rc-service "$svc" reload; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if rc-service "$svc" restart; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2461,6 +2674,11 @@ restart_one() {
     fi
   fi
   if command -v service >/dev/null 2>&1; then
+    if [[ "$action" == "reload" ]] && service "$svc" reload; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if service "$svc" restart; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2472,7 +2690,7 @@ restart_one() {
 }
 
 restart_affected() {
-  local svc seen=$'\n' failed=0
+  local action=${1:-restart} svc seen=$'\n' failed=0
   RESTARTS_DONE=0
   while IFS= read -r svc; do
     [[ -n "$svc" ]] || continue
@@ -2480,7 +2698,7 @@ restart_affected() {
     [[ "$seen" == *$'\n'"$svc"$'\n'* ]] && continue
     seen="${seen}${svc}"$'\n'
     if service_is_active "$svc"; then
-      restart_one "$svc" || failed=1
+      restart_one "$svc" "$action" || failed=1
     else
       say "service ${svc} is not active; leaving it stopped"
     fi
@@ -2497,7 +2715,7 @@ restart_affected() {
 
 write_marked_file() {
   local logical=$1 begin=$2 end=$3 block=$4
-  local path tmp mode
+  local path tmp
   safe_logical_path "$logical" || return 1
   path=$(rootp "$logical")
   if [[ -L "$path" ]]; then
@@ -2507,38 +2725,47 @@ write_marked_file() {
       err "refusing to follow a symlink outside the test root: $logical"
       return 1
     fi
+    if [[ -z "$TEST_ROOT" ]] && ! safe_logical_path "$real"; then
+      err "refusing to follow ${logical} to ${real}, outside config roots"
+      return 1
+    fi
+    path=$real
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: would update ${logical} between markers"
-    emit_notice <<EOF
+    emit_notice <<EOF2
 ${begin}
 ${block}
 ${end}
-EOF
+EOF2
     return 0
   fi
-  mkdir -p "$(dirname "$path")"
-  tmp=$(mktemp)
+  mkdir -p "$(dirname "$path")" || { err "could not create $(dirname "$logical")"; return 1; }
+  tmp=$(new_tmp_beside "$path") || return 1
   if [[ -f "$path" ]]; then
-    awk -v b="$begin" -v e="$end" '
+    if ! awk -v b="$begin" -v e="$end" '
       $0 == b {skip=1; next}
       $0 == e {skip=0; next}
       skip == 1 {next}
       {print}
-    ' "$path" >"$tmp"
-    mode=$(stat -c %a "$path" 2>/dev/null || echo 644)
+    ' "$path" >"$tmp"; then
+      rm -f "$tmp"
+      err "could not read ${logical}"
+      return 1
+    fi
   else
-    : >"$tmp"
-    mode=644
-    record_created "$logical"
+    record_created "$logical" || { rm -f "$tmp"; return 1; }
   fi
-  {
+  if ! {
     printf '\n%s\n' "$begin"
     printf '%s\n' "$block"
     printf '%s\n' "$end"
-  } >>"$tmp"
-  chmod "$mode" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$path"
+  } >>"$tmp"; then
+    rm -f "$tmp"
+    err "could not write ${logical}"
+    return 1
+  fi
+  install_tmp "$tmp" "$path" || return 1
   note_action "updated ${logical}"
 }
 
@@ -2600,7 +2827,7 @@ apache_admin_block() {
 
 inject_pool_file() {
   local logical=$1 block=$2
-  local path tmp stripped blockfile mode
+  local path tmp stripped blockfile
   safe_logical_path "$logical" || return 1
   path=$(rootp "$logical")
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -2608,12 +2835,15 @@ inject_pool_file() {
     printf '%s\n' "$block" | emit_notice
     return 0
   fi
-  [[ -f "$path" ]] || return 1
-  tmp=$(mktemp)
-  stripped=$(mktemp)
-  blockfile=$(mktemp)
+  [[ -f "$path" ]] || { err "pool file is missing: ${logical}"; return 1; }
+  if [[ -L "$path" ]]; then
+    path=$(readlink -f "$path") || return 1
+  fi
+  tmp=$(new_tmp_beside "$path") || return 1
+  stripped=$(mktemp) || { rm -f "$tmp"; return 1; }
+  blockfile=$(mktemp) || { rm -f "$tmp" "$stripped"; return 1; }
   printf '%s\n' "$block" >"$blockfile"
-  awk -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" -v limit="$DO_MAX_REQUESTS" '
+  if ! awk -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" -v limit="$DO_MAX_REQUESTS" '
     $0 == b {skip=1; next}
     $0 == e {skip=0; next}
     skip == 1 {next}
@@ -2622,8 +2852,12 @@ inject_pool_file() {
       next
     }
     {print}
-  ' "$path" >"$stripped"
-  awk -v bf="$blockfile" -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" '
+  ' "$path" >"$stripped"; then
+    rm -f "$tmp" "$stripped" "$blockfile"
+    err "could not read ${logical}"
+    return 1
+  fi
+  if ! awk -v bf="$blockfile" -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" '
     function emit(   line) {
       print ""
       print b
@@ -2639,11 +2873,13 @@ inject_pool_file() {
     }
     {print}
     END { if (seen) emit() }
-  ' "$stripped" >"$tmp"
-  mode=$(stat -c %a "$path" 2>/dev/null || echo 644)
-  chmod "$mode" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$path"
+  ' "$stripped" >"$tmp"; then
+    rm -f "$tmp" "$stripped" "$blockfile"
+    err "could not write ${logical}"
+    return 1
+  fi
   rm -f "$stripped" "$blockfile"
+  install_tmp "$tmp" "$path" || return 1
   note_action "updated pool ${logical}"
 }
 
@@ -2785,7 +3021,8 @@ apply_workarounds() {
       return 1
     fi
   fi
-  begin_backup
+  begin_backup || { err "no backup could be made. Nothing was changed."; return 4; }
+  local failed=0
   local seen_drop=$'\n'
   while IFS= read -r i; do
     [[ -n "${F_VERSION[i]}" ]] || continue
@@ -2797,10 +3034,10 @@ apply_workarounds() {
       seen_drop="${seen_drop}${drop}"$'\n'
       logical="${drop}/99-stacutis-php2shell.ini"
       if [[ "$DRY_RUN" -eq 0 && ! -d "$(rootp "$drop")" ]]; then
-        mkdir -p "$(rootp "$drop")"
+        mkdir -p "$(rootp "$drop")" || failed=1
       fi
       if [[ -f "$(rootp "$logical")" ]]; then
-        backup_existing "$logical"
+        backup_existing "$logical" || failed=1
       fi
       local block
       block=$(dropin_block "$major" "$minor")
@@ -2810,14 +3047,16 @@ apply_workarounds() {
       if [[ "$WORK_UPLOAD" -eq 0 ]]; then
         block=$(printf '%s\n' "$block" | awk '!/session.upload_progress/')
       fi
-      write_marked_file "$logical" "; stacutis-php2shell begin" "; stacutis-php2shell end" "$block"
+      if [[ "$failed" -eq 0 ]]; then
+        write_marked_file "$logical" "; stacutis-php2shell begin" "; stacutis-php2shell end" "$block" || failed=1
+      fi
     fi
     if [[ "${F_SAPI[i]}" == "fpm" || "${F_SAPI[i]}" == "frankenphp" || "${F_SAPI[i]}" == "litespeed" ]]; then
       local IFS=$'\x1e'
       for pool in ${F_POOLS[i]}; do
         IFS=$'\n\t'
-        [[ -n "$pool" ]] || continue
-        backup_existing "$pool"
+        [[ -n "$pool" && "$failed" -eq 0 ]] || continue
+        backup_existing "$pool" || { failed=1; continue; }
         local ablock
         ablock=$(fpm_admin_block "$major" "$minor")
         if [[ "$WORK_FATAL" -eq 0 ]]; then
@@ -2832,7 +3071,7 @@ apply_workarounds() {
         if [[ "$DO_MAX_REQUESTS" -eq 1 ]]; then
           ablock="${ablock}"$'\n'"pm.max_requests = 1"
         fi
-        inject_pool_file "$pool" "$ablock"
+        inject_pool_file "$pool" "$ablock" || failed=1
       done
       IFS=$'\n\t'
     fi
@@ -2858,18 +3097,22 @@ apply_workarounds() {
         a_major=8
         a_minor=3
       fi
-      if [[ -f "$(rootp "$a_logical")" ]]; then
-        backup_existing "$a_logical"
+      if [[ "$failed" -eq 0 && -f "$(rootp "$a_logical")" ]]; then
+        backup_existing "$a_logical" || failed=1
       fi
       local ab
       ab=$(apache_admin_block "$a_major" "$a_minor")
-      write_marked_file "$a_logical" "# stacutis-php2shell begin" "# stacutis-php2shell end" "$ab"
+      if [[ "$failed" -eq 0 ]]; then
+        write_marked_file "$a_logical" "# stacutis-php2shell begin" "# stacutis-php2shell end" "$ab" || failed=1
+      fi
       if [[ "$a_logical" == /etc/apache2/conf-available/* ]]; then
         local link="/etc/apache2/conf-enabled/stacutis-php2shell.conf"
-        if [[ "$DRY_RUN" -eq 0 && -d "$(rootp /etc/apache2/conf-enabled)" && ! -e "$(rootp "$link")" ]]; then
-          ln -s ../conf-available/stacutis-php2shell.conf "$(rootp "$link")"
-          record_created "$link"
-          note_action "enabled apache conf ${link}"
+        if [[ "$failed" -eq 0 && "$DRY_RUN" -eq 0 && -d "$(rootp /etc/apache2/conf-enabled)" && ! -e "$(rootp "$link")" ]]; then
+          if record_created "$link" && ln -s ../conf-available/stacutis-php2shell.conf "$(rootp "$link")"; then
+            note_action "enabled apache conf ${link}"
+          else
+            failed=1
+          fi
         elif [[ "$DRY_RUN" -eq 1 ]]; then
           say "dry-run: would symlink ${link}"
         fi
@@ -2879,17 +3122,28 @@ apply_workarounds() {
     fi
   fi
 
+  if [[ "$failed" -eq 1 ]]; then
+    err "a config write failed. Putting the previous files back."
+    undo_run_edits
+    seal_backup
+    return 4
+  fi
   print_proxy_advice
   seal_backup
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: no files written, no services restarted."
     return 0
   fi
+  if ! config_tests_pass; then
+    err "the new settings did not pass the config test. Putting the previous files back."
+    undo_run_edits
+    return 4
+  fi
   out ""
   out "${RED}Still VULNERABLE until PHP is upgraded.${RESET}"
   printf '\n%s%sStill VULNERABLE until PHP is upgraded.%s\n' "$BOLD" "$RED" "$RESET" >&2
-  if ! restart_affected; then
-    err "settings were written and at least one restart failed. Old workers may still be in memory."
+  if ! restart_affected reload; then
+    err "settings were written and at least one reload failed. Old workers may still be in memory."
     return 4
   fi
   return 0
@@ -3173,23 +3427,30 @@ do_fix() {
     say "Stopped before any change."
     return 1
   fi
-  begin_backup
-  local i
+  begin_backup || { err "no backup could be made. Nothing was installed."; return 4; }
+  local i bfail=0
   while IFS= read -r i; do
     if [[ -n "${F_MAININI[i]}" && -f "$(rootp "${F_MAININI[i]}")" ]]; then
-      backup_existing "${F_MAININI[i]}"
+      backup_existing "${F_MAININI[i]}" || bfail=1
     fi
     local pool
     local IFS=$'\x1e'
     for pool in ${F_POOLS[i]}; do
       IFS=$'\n\t'
-      [[ -n "$pool" ]] && backup_existing "$pool"
+      if [[ -n "$pool" ]]; then
+        backup_existing "$pool" || bfail=1
+      fi
     done
     IFS=$'\n\t'
     if [[ -n "${F_PKG[i]}" && "${F_PKG[i]}" != "unknown" ]]; then
       record_package_version "${F_PKG[i]}" "${F_PKGVER[i]}"
     fi
   done < <(vulnerable_indexes)
+  if [[ "$bfail" -eq 1 ]]; then
+    err "a config backup failed. Nothing was installed."
+    seal_backup
+    return 4
+  fi
 
   if ! refresh_candidate_metadata; then
     err "could not refresh package metadata"
@@ -3256,25 +3517,35 @@ do_fix() {
       note_action "test-root simulated upgrade ${p} -> ${cand}"
     done
   else
+    local pm_rc=0
     case "$PM" in
       apt)
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "${install_pkgs[@]}"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "${install_pkgs[@]}" || pm_rc=$?
         ;;
       dnf)
-        dnf upgrade -y "${install_pkgs[@]}"
+        dnf upgrade -y "${install_pkgs[@]}" || pm_rc=$?
         ;;
       yum)
-        yum upgrade -y "${install_pkgs[@]}"
+        yum upgrade -y "${install_pkgs[@]}" || pm_rc=$?
         ;;
       apk)
-        apk upgrade "${install_pkgs[@]}"
+        apk upgrade "${install_pkgs[@]}" || pm_rc=$?
         ;;
     esac
+    if [[ "$pm_rc" -ne 0 ]]; then
+      err "the ${PM} upgrade failed (exit ${pm_rc}). No service was restarted. Check the package state before you restart anything."
+      seal_backup
+      return 4
+    fi
     note_action "upgraded: ${install_pkgs[*]}"
   fi
 
   seal_backup
-  if ! restart_affected; then
+  if ! config_tests_pass; then
+    err "the upgrade finished but the config test failed. No service was restarted, so the old workers keep serving. Fix the config, then restart PHP."
+    return 4
+  fi
+  if ! restart_affected restart; then
     err "upgrade finished and at least one restart failed. Workers may still be running the old binary."
     return 4
   fi
@@ -3307,38 +3578,15 @@ do_rollback() {
     say "Stopped before any change."
     return 1
   fi
-  local kind path src dest
-  while IFS=' ' read -r kind path _; do
-    [[ "$kind" == "CREATED" ]] || continue
-    case "$(basename "$path")" in
-      *stacutis-php2shell*) ;;
-      *)
-        err "manifest contains an unexpected created path: $path"
-        return 4
-        ;;
-    esac
-    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
-    rm -f "$(rootp "$path")"
-    note_action "removed ${path}"
-  done <"$dir/manifest"
-  while IFS=' ' read -r kind path _; do
-    [[ "$kind" == "EXISTING" ]] || continue
-    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
-    src="${dir}/files${path}"
-    dest=$(rootp "$path")
-    if [[ ! -e "$src" ]]; then
-      err "backup is missing ${src}"
-      return 4
-    fi
-    if [[ -d "$dest" && ! -L "$dest" ]]; then
-      err "refusing to replace directory ${path}"
-      return 4
-    fi
-    mkdir -p "$(dirname "$dest")"
-    rm -f "$dest"
-    cp -a "$src" "$dest"
-    note_action "restored ${path}"
-  done <"$dir/manifest"
+  local rc=0 kind
+  restore_backup_files "$dir" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+  if ! config_tests_pass; then
+    err "the restored configs do not pass the config test. No service was restarted."
+    return 4
+  fi
   local svc
   while IFS=' ' read -r kind svc _; do
     [[ "$kind" == "SERVICE" ]] || continue

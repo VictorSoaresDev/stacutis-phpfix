@@ -8,7 +8,7 @@ Paste this into the server's terminal. It downloads the scanner, checks the file
 
 ```sh
 cd /tmp &&
-curl -fsSL -O https://www.stacutis.com/php2shell.sh &&
+curl -fsSL -o stacutis-php2shell.sh https://www.stacutis.com/php2shell.sh &&
 curl -fsSL -O https://www.stacutis.com/CHECKSUMS.txt &&
 sha256sum -c CHECKSUMS.txt &&
 bash stacutis-php2shell.sh
@@ -23,7 +23,7 @@ Provided as-is. Run it only on systems you own or administer. Take a backup befo
 ## Workaround tradeoffs
 
 > [!CAUTION]
-> Temporary settings do not upgrade PHP. The vulnerable build stays installed. The next scan can say MITIGATED, and the exit code stays 1. PHP restarts and drops requests in flight. Settings are written as admin config, so the site cannot turn them back on with `.user.ini` or `ini_set`. Config is copied to `/var/backups/stacutis/<stamp>/`. `--rollback <stamp>` restores those files and restarts the recorded services. It does not change packages.
+> Temporary settings do not upgrade PHP. The vulnerable build stays installed. The next scan can say MITIGATED, and the exit code stays 1. The new config is tested before anything restarts. If the test fails, the old files go back and nothing restarts. PHP is then reloaded, or restarted when a reload is not possible. A failed write also puts the old files back. Settings are written as admin config, so the site cannot turn them back on with `.user.ini` or `ini_set`. Config is copied to `/var/backups/stacutis/<stamp>/`. `--rollback <stamp>` restores those files and restarts the recorded services. It does not change packages.
 
 On a terminal the same tradeoffs are printed in red before each yes.
 
@@ -40,6 +40,12 @@ On a terminal the same tradeoffs are printed in red before each yes.
 ## Scan and upgrade
 
 The default run is read-only and does not use the network. It finds CLI `php`, PHP-FPM, `mod_php`, php-cgi, FrankenPHP, and LiteSpeed `lsphp`, and it reads the local package changelog only. PATCHED (backport) needs both CVE IDs on lines that are not not-affected, wontfix, no-dsa, unfixed, or ignored. This tool rates `mod_php` highest risk because [GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) shows code execution when `mod_php` runs shutdown after a failed startup. That GHSA also says a complete PHP-FPM exploit was not demonstrated for that CVE. PHP 8.1 and older stay vulnerable unless the local changelog names both CVEs.
+
+The changelog only counts for the package that owns the binary. A PHP you built yourself, or one in `/usr/local`, is never marked patched because a distro package on the same host is.
+
+To read a version the tool runs `php -v` only when root owns the binary and nobody else can write it or any directory above it. It never runs a binary found through `/proc`. In every other case it reads the version string from the file without running it.
+
+PHP running inside a container or another mount namespace is listed in its own section, "PHP running in containers or other namespaces". Its path does not exist on the host, so `--fix` and `--workarounds` leave it alone. BELOW_FIX means the upstream version is older than the fix. A distro build inside the container may still have a backport, and only a check inside the container can tell. These entries change the exit code only when you pass `--containers`.
 
 `--fix` upgrades with apt, dnf, yum, or apk, and only a same-branch candidate at or above the fixed release, or one whose changelog names both CVEs. It does not compile PHP, does not add repositories, and does not move 8.1 and older to a new major version. Ondrej's PPA and remi are named only as archives a host may already use. The tool will not enable them.
 
