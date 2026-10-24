@@ -786,7 +786,9 @@ EOF2
   assert_eq "c2 static version from writable binary" "$(finding 8.2.11 cli | cut -f1)" "VULNERABLE"
 fi
 
-if want "h1-write-failure"; then
+if want "h1-write-failure" && [[ "$(id -u)" -eq 0 ]]; then
+  pass "h1 skipped: root ignores directory permissions"
+elif want "h1-write-failure"; then
   root=$(vuln_fpm)
   confd="$root/etc/php/8.3/fpm/conf.d"
   pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
@@ -990,6 +992,106 @@ if want "l1-nonroot-warning"; then
   else
     pass "l1 skipped as root"
   fi
+fi
+
+# Post-merge regressions. Package managers are replaced by tiny fakes on PATH.
+if want "pm1-apk-candidate"; then
+  fake=$(mktemp -d); keep "$fake"
+  cat >"$fake/apk" <<'FAKE'
+#!/bin/sh
+case "$1" in
+  list) echo "php83-8.3.36-r0 x86_64 {php83} (PHP-3.01) [upgradable from: php83-8.3.15-r0]"
+        echo "php83-fpm-8.3.36-r0 x86_64 {php83} (PHP-3.01) [upgradable from: php83-fpm-8.3.15-r0]" ;;
+  policy) printf '%s policy:\n  8.3.15-r0:\n    lib/apk/db/installed\n  8.3.36-r0:\n    https://example/community\n' "$2" ;;
+esac
+FAKE
+  chmod +x "$fake/apk"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^candidate_version_of()/,/^}/p' "$SCRIPT")
+  TEST_ROOT="" PM=apk
+  got=$(PATH="$fake:$PATH" candidate_version_of php83)
+  assert_eq "pm1 apk candidate has no colon" "$got" "8.3.36-r0"
+  got=$(PATH="$fake:$PATH" candidate_version_of php83-fpm)
+  assert_eq "pm1 apk candidate for -fpm is not php83's" "$got" "8.3.36-r0"
+  got=$(PATH="$fake:$PATH" candidate_version_of php83-cli)
+  assert_eq "pm1 apk no candidate gives nothing" "$got" ""
+fi
+
+if want "pm2-dnf-candidate-changelog"; then
+  fake=$(mktemp -d); keep "$fake"
+  cat >"$fake/dnf" <<'FAKE'
+#!/bin/sh
+printf 'Changelog for php-fpm-8.0.30-8.el9_8.1\n* Mon Oct 19 2026 R - 8.0.30-8.1\n- Avoid state corruption via bailout\n  CVE-2026-109618, CVE-2026-109619\n'
+FAKE
+  chmod +x "$fake/dnf"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^candidate_changelog_file()/,/^}/p' "$SCRIPT")
+  TEST_ROOT="" PM=dnf
+  out=$(mktemp)
+  PATH="$fake:$PATH" candidate_changelog_file php-fpm "$out"
+  grep -q 'CVE-2026-109619' "$out" && pass "pm2 dnf candidate changelog is read" || fail "pm2 dnf candidate changelog is read"
+  rm -f "$out"
+fi
+
+if want "pm3-sysv-active"; then
+  fake=$(mktemp -d); keep "$fake"
+  printf '#!/bin/sh\n[ "$1" = php8.2-fpm ] && [ "$2" = status ]\n' >"$fake/service"
+  chmod +x "$fake/service"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^service_is_active()/,/^}/p' "$SCRIPT")
+  TEST_ROOT=""
+  (PATH="$fake" service_is_active php8.2-fpm) && pass "pm3 sysv service seen as active" || fail "pm3 sysv service seen as active"
+  (PATH="$fake" service_is_active php9-fpm) && fail "pm3 unknown service is not active" || pass "pm3 unknown service is not active"
+fi
+
+if want "pm4-apt-changelog-fallback"; then
+  fake=$(mktemp -d); keep "$fake"
+  mkdir -p "$fake/pkg/usr/share/doc/php8.1-common"
+  printf 'php8.1 (8.1.2-1ubuntu2.28) jammy; urgency=medium\n  * CVE-2026-109618\n  * CVE-2026-109619\n' | gzip -9n >"$fake/pkg/usr/share/doc/php8.1-common/changelog.Debian.gz"
+  ln -s php8.1-common "$fake/pkg/usr/share/doc/php8.1-fpm"
+  (cd "$fake/pkg" && tar -cf ../data.tar .)
+  cat >"$fake/apt-get" <<'FAKE'
+#!/bin/sh
+case "$1" in
+  changelog) echo "Err:1 https://changelogs.example Changelog unavailable (404)"; exit 100 ;;
+  download) : >"$2_1.0_amd64.deb" ;;
+esac
+FAKE
+  printf '#!/bin/sh\n[ "$1" = --fsys-tarfile ] && cat "%s/data.tar"\n' "$fake" >"$fake/dpkg-deb"
+  printf '#!/bin/sh\nexit 0\n' >"$fake/dpkg-query"
+  printf '#!/bin/sh\nexit 0\n' >"$fake/apt-cache"
+  chmod +x "$fake"/apt-get "$fake"/dpkg-deb "$fake"/dpkg-query "$fake"/apt-cache
+  # shellcheck disable=SC1090
+  source <(sed -n '/^append_changelog_file()/,/^}/p;/^changelog_from_candidate_deb()/,/^}/p;/^fetch_apt_changelog()/,/^}/p' "$SCRIPT")
+  TEST_ROOT="" WORK_TMP=$(mktemp -d); keep "$WORK_TMP"
+  out=$(mktemp)
+  PATH="$fake:$PATH" fetch_apt_changelog php8.1-fpm "$out"
+  grep -q 'CVE-2026-109619' "$out" && pass "pm4 changelog read from the candidate deb through a doc symlink" || fail "pm4 changelog read from the candidate deb through a doc symlink"
+  grep -q 'Changelog unavailable' "$out" && fail "pm4 apt error text is not kept" || pass "pm4 apt error text is not kept"
+  rm -f "$out"
+fi
+
+if want "pm5-harden-path"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^harden_path()/,/^}/p' "$SCRIPT")
+  wd=$(mktemp -d); keep "$wd"; chmod 777 "$wd"
+  got=$(PATH=".::relative/bin:$wd:/nonexistent:/usr/bin" harden_path; printf '%s' "$PATH")
+  assert_eq "pm5 only safe directories remain" "$got" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
+
+if want "pm6-space-in-path"; then
+  root=$(vuln_fpm)
+  pooldir="$root/etc/php/8.3/fpm/pool.d"
+  printf '[second]\nuser = www-data\nlisten = /run/second.sock\n' >"$pooldir/my pool.conf"
+  a=$(cksum <"$pooldir/my pool.conf")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  grep -q 'stacutis-php2shell begin' "$pooldir/my pool.conf" && pass "pm6 pool with a space was changed" || fail "pm6 pool with a space was changed"
+  stamp=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -1)
+  run_tool --rollback "$stamp" --yes --test-root "$root"
+  assert_eq "pm6 rollback restores the pool with a space" "$(cksum <"$pooldir/my pool.conf")" "$a"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^safe_logical_path()/,/^}/p' "$SCRIPT")
+  safe_logical_path $'/etc/php/x\nCREATED /etc/passwd' && fail "pm6 newline path refused" || pass "pm6 newline path refused"
 fi
 
 if [[ -e "$host_log" ]]; then

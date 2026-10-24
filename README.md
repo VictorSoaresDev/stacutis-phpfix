@@ -26,7 +26,7 @@ A checksum only proves the download wasn't broken. If you want more, compare it 
 - Your distro's package changelog, so backported fixes count as PATCHED.
 - Optional: `--ioc` looks for signs of exploitation in logs, `--containers` lists PHP-looking Docker containers.
 
-The scan is read-only, works without root, uses no network and sends nothing anywhere.
+The scan changes nothing on the host, works without root (some files may then be unreadable), uses no network and sends nothing anywhere. To read versions it runs `php -v` style commands, but only on binaries that are owned by root in root-owned directories. Other binaries are never run, and their version is read from the file instead.
 
 ## What it changes
 
@@ -34,8 +34,8 @@ Nothing, unless you pass one of these flags **and** answer `y` (or add `--yes`).
 
 | Option | Touches | Undo |
 | --- | --- | --- |
-| `--fix` | Upgrades installed PHP packages with your package manager (`apt-get install --only-upgrade`, `dnf/yum upgrade`, `apk upgrade`), same branch only. Restarts PHP-FPM / Apache so workers load the new code. No new repos, no compiling. | A normal package downgrade, if you really need one. |
-| `--workarounds` | Writes `<php conf.d>/99-stacutis-php2shell.ini`, adds a marked `stacutis-php2shell` block to vulnerable FPM pool files, and on mod_php hosts writes `/etc/apache2/conf-available/stacutis-php2shell.conf` (+ `conf-enabled` link) or `/etc/httpd/conf.d/stacutis-php2shell.conf`. Restarts those services. | `--rollback <stamp>` (see below). |
+| `--fix` | Upgrades installed PHP packages with your package manager (`apt-get install --only-upgrade`, `dnf/yum upgrade`, `apk upgrade`), same branch only. Restarts PHP-FPM / Apache so workers load the new code. No new repos, no compiling. It uses the network through your package manager, and it only installs a package it can confirm contains the fix (by version, or because the package changelog names both CVEs). Held packages are skipped. | A normal package downgrade, if you really need one. |
+| `--workarounds` | Writes `<php conf.d>/99-stacutis-php2shell.ini`, adds a marked `stacutis-php2shell` block to vulnerable FPM pool files, and on mod_php hosts writes `/etc/apache2/conf-available/stacutis-php2shell.conf` (+ `conf-enabled` link) or `/etc/httpd/conf.d/stacutis-php2shell.conf`. Tests the PHP and web server config first. If the test fails, the old files are put back and nothing is reloaded. Then reloads the services (restarts only when a reload is not possible). | `--rollback <stamp>` (see below). |
 | `--log` | Appends one line to `/var/log/stacutis-php2shell.log`. | Delete the file. |
 
 Workarounds are temporary, not a fix. By default they only turn off `session.upload_progress` (and fatal error backtraces on 8.5). Smaller post/upload limits, `memory_limit=-1` and `pm.max_requests=1` each need their own flag because they can break things. Tradeoffs are printed in red before each prompt; full list in [docs/DETAILS.md](docs/DETAILS.md#workaround-tradeoffs).
@@ -64,11 +64,12 @@ That restores the files and restarts the services it had restarted. Package upgr
 | `--rollback STAMP` | Restore a workaround backup |
 | `--dry-run` | Show what would change, write nothing |
 | `--yes` | Say yes to the action you picked (doesn't pick one for you) |
-| `--ioc` / `--containers` / `--containers-exec` | Extra read-only checks |
+| `--ioc` / `--containers` | Extra read-only checks |
+| `--containers-exec` | With `--containers`: runs `php -v` inside every running container (this executes a command in each container) |
 | `--json` / `--quiet` / `--no-color` / `--log` | Output options |
 | `--help` / `--version` | |
 
-Exit codes: 0 patched or no PHP, 1 vulnerable or only mitigated, 2 bad usage, 3 unknown, 4 change failed, 5 needs root.
+Exit codes: 0 patched or no PHP, 1 vulnerable or only mitigated, 2 bad usage, 3 unknown, 4 change failed or no confirmed fix was available (nothing was changed in that case), 5 needs root.
 
 ## License and credits
 
