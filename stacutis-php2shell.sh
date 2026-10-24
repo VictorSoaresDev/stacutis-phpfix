@@ -2738,6 +2738,10 @@ service_is_active() {
   if command -v rc-service >/dev/null 2>&1; then
     rc-service "$svc" status >/dev/null 2>&1 && return 0
   fi
+  # SysV init scripts (Debian or Ubuntu without systemd, containers).
+  if command -v service >/dev/null 2>&1; then
+    service "$svc" status >/dev/null 2>&1 && return 0
+  fi
   return 1
 }
 
@@ -3403,7 +3407,12 @@ candidate_version_of() {
     return 0
   fi
   if [[ "$PM" == "apk" ]]; then
-    apk policy "$pkg" 2>/dev/null | awk 'NR>2 && $1 ~ /^[0-9]/ {print $1; exit}'
+    # "apk list -u" names only a real upgrade: "php83-8.3.36-r0 x86_64 ...".
+    apk list -u "$pkg" 2>/dev/null | awk -v p="$pkg" '
+      index($1, p "-") == 1 {
+        v = substr($1, length(p) + 2)
+        if (v ~ /^[0-9]/) {print v; exit}
+      }'
     return 0
   fi
   return 1
@@ -3415,6 +3424,12 @@ candidate_changelog_file() {
   if [[ -n "$TEST_ROOT" ]]; then
     append_changelog_file "$(rootp "/fixture/candidate-changelogs/${pkg}")" "$dest"
     return 0
+  fi
+  # dnf can print the changelog of the upgrade candidate from repo metadata,
+  # without installing it. apt is handled after "apt-get update"; apk has
+  # no changelog and is judged by the upstream version alone.
+  if [[ "$PM" == "dnf" ]]; then
+    dnf -q repoquery --changelogs --upgrades --latest-limit=1 "$pkg" >"$dest" 2>/dev/null || true
   fi
   return 0
 }
@@ -3576,7 +3591,16 @@ fetch_apt_changelog() {
     append_changelog_file "$(rootp "/fixture/candidate-changelogs/${pkg}")" "$dest"
     return 0
   fi
-  apt-get changelog "$pkg" >"$dest" 2>/dev/null || true
+  # On failure apt prints its error text on stdout, so drop it.
+  if ! apt-get changelog "$pkg" >"$dest" 2>/dev/null; then
+    : >"$dest"
+  fi
+  # The changelog server can be unreachable or return 404 for fresh security
+  # uploads. The signed candidate package itself carries the same changelog.
+  if [[ ! -s "$dest" ]]; then
+    : >"$dest"
+    changelog_from_candidate_deb "$pkg" "$dest" || true
+  fi
   # The changelog server can return 404 for new security uploads. If this
   # exact candidate is already installed, its local changelog is the same text.
   if [[ ! -s "$dest" ]]; then
@@ -3589,6 +3613,47 @@ fetch_apt_changelog() {
       done
     fi
   fi
+}
+
+# changelog_from_candidate_deb PKG DEST [DEPTH]. Downloads the signed candidate
+# .deb with "apt-get download" into a private temp dir and reads its changelog
+# without installing or running anything. Debian packages often make one
+# binary's doc directory a symlink to another's, so one hop is followed.
+changelog_from_candidate_deb() {
+  local pkg=$1 dest=$2 depth=${3:-0}
+  local dir deb name listing target
+  command -v dpkg-deb >/dev/null 2>&1 || return 1
+  dir=$(mktemp -d "${WORK_TMP:-/tmp}/deb.XXXXXX" 2>/dev/null) || return 1
+  if ! (cd "$dir" && apt-get download "$pkg" >/dev/null 2>&1); then
+    rm -rf "$dir"
+    return 1
+  fi
+  deb=""
+  for name in "$dir"/*.deb; do
+    [[ -f "$name" ]] && deb=$name
+  done
+  if [[ -z "$deb" ]]; then
+    rm -rf "$dir"
+    return 1
+  fi
+  for name in changelog.Debian.gz changelog.gz; do
+    dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
+      | tar -xOf - "./usr/share/doc/${pkg}/${name}" 2>/dev/null \
+      | gzip -dc >>"$dest" 2>/dev/null || true
+    [[ -s "$dest" ]] && break
+  done
+  if [[ ! -s "$dest" && "$depth" -eq 0 ]]; then
+    listing=$(dpkg-deb --fsys-tarfile "$deb" 2>/dev/null | tar -tvf - "./usr/share/doc/${pkg}" 2>/dev/null || true)
+    target=$(printf '%s\n' "$listing" | awk -v p="./usr/share/doc/${pkg}" '$0 ~ (p " -> ") {print $NF; exit}')
+    target=${target##*/}
+    if [[ "$target" =~ ^[a-z0-9][a-z0-9+.-]*$ && "$target" != "$pkg" ]]; then
+      rm -rf "$dir"
+      changelog_from_candidate_deb "$target" "$dest" 1
+      return $?
+    fi
+  fi
+  rm -rf "$dir"
+  [[ -s "$dest" ]]
 }
 
 apply_simulated_upgrade() {
