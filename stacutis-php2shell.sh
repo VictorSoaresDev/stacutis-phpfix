@@ -2464,7 +2464,7 @@ json_report() {
 
 safe_logical_path() {
   case "$1" in
-    */../*|*/..) return 1 ;;
+    */../*|*/..|*$'\n'*|*$'\r'*) return 1 ;;
     /etc/*|/usr/local/etc/*|/usr/local/lsws/conf/*) return 0 ;;
     /opt/cpanel/ea-php*/root/etc/*|/opt/plesk/php/*/etc/*|/opt/alt/php*/etc/*) return 0 ;;
     *) return 1 ;;
@@ -2572,7 +2572,7 @@ new_tmp_beside() {
 # failed config test.
 restore_backup_files() {
   local dir=$1 kind path src dest bad=0
-  while IFS=' ' read -r kind path _; do
+  while IFS=' ' read -r kind path; do
     [[ "$kind" == "CREATED" ]] || continue
     case "$(basename "$path")" in
       *stacutis-php2shell*) ;;
@@ -2585,7 +2585,7 @@ restore_backup_files() {
     rm -f "$(rootp "$path")" || bad=1
     note_action "removed ${path}"
   done <"$dir/manifest"
-  while IFS=' ' read -r kind path _; do
+  while IFS=' ' read -r kind path; do
     [[ "$kind" == "EXISTING" ]] || continue
     safe_logical_path "$path" || { err "refusing path $path"; return 4; }
     src="${dir}/files${path}"
@@ -4000,11 +4000,36 @@ report_all() {
   json_report
 }
 
+# harden_path: this script runs as root and calls package managers, apachectl
+# and systemctl by name. Start from the standard system directories, then keep
+# the caller's PATH entries only if they are absolute, exist, are owned by root
+# and are not writable by group or others. This drops ".", empty entries and
+# user-writable directories.
+harden_path() {
+  local safe=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  local entry owner mode old_ifs=$IFS
+  IFS=:
+  for entry in $PATH; do
+    [[ "$entry" == /* && -d "$entry" ]] || continue
+    case ":${safe}:" in *":${entry}:"*) continue ;; esac
+    owner=$(stat -c %u -- "$entry" 2>/dev/null || true)
+    mode=$(stat -c %a -- "$entry" 2>/dev/null || true)
+    [[ "$owner" == 0 && -n "$mode" && "${mode: -2}" != *[2367]* ]] || continue
+    safe="${safe}:${entry}"
+  done
+  IFS=$old_ifs
+  PATH=$safe
+  export PATH
+}
+
 main() {
   WORK_TMP=$(mktemp -d 2>/dev/null || true)
   trap cleanup_tmp EXIT
   trap 'exit 130' INT TERM
   parse_args "$@"
+  if [[ -z "$TEST_ROOT" ]]; then
+    harden_path
+  fi
   setup_colors
   stale_data_warning
   if [[ -z "$TEST_ROOT" && "$(id -u)" -ne 0 ]]; then

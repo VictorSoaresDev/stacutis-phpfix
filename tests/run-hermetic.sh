@@ -786,7 +786,9 @@ EOF2
   assert_eq "c2 static version from writable binary" "$(finding 8.2.11 cli | cut -f1)" "VULNERABLE"
 fi
 
-if want "h1-write-failure"; then
+if want "h1-write-failure" && [[ "$(id -u)" -eq 0 ]]; then
+  pass "h1 skipped: root ignores directory permissions"
+elif want "h1-write-failure"; then
   root=$(vuln_fpm)
   confd="$root/etc/php/8.3/fpm/conf.d"
   pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
@@ -1067,6 +1069,29 @@ FAKE
   grep -q 'CVE-2026-109619' "$out" && pass "pm4 changelog read from the candidate deb through a doc symlink" || fail "pm4 changelog read from the candidate deb through a doc symlink"
   grep -q 'Changelog unavailable' "$out" && fail "pm4 apt error text is not kept" || pass "pm4 apt error text is not kept"
   rm -f "$out"
+fi
+
+if want "pm5-harden-path"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^harden_path()/,/^}/p' "$SCRIPT")
+  wd=$(mktemp -d); keep "$wd"; chmod 777 "$wd"
+  got=$(PATH=".::relative/bin:$wd:/nonexistent:/usr/bin" harden_path; printf '%s' "$PATH")
+  assert_eq "pm5 only safe directories remain" "$got" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
+
+if want "pm6-space-in-path"; then
+  root=$(vuln_fpm)
+  pooldir="$root/etc/php/8.3/fpm/pool.d"
+  printf '[second]\nuser = www-data\nlisten = /run/second.sock\n' >"$pooldir/my pool.conf"
+  a=$(cksum <"$pooldir/my pool.conf")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  grep -q 'stacutis-php2shell begin' "$pooldir/my pool.conf" && pass "pm6 pool with a space was changed" || fail "pm6 pool with a space was changed"
+  stamp=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -1)
+  run_tool --rollback "$stamp" --yes --test-root "$root"
+  assert_eq "pm6 rollback restores the pool with a space" "$(cksum <"$pooldir/my pool.conf")" "$a"
+  # shellcheck disable=SC1090
+  source <(sed -n '/^safe_logical_path()/,/^}/p' "$SCRIPT")
+  safe_logical_path $'/etc/php/x\nCREATED /etc/passwd' && fail "pm6 newline path refused" || pass "pm6 newline path refused"
 fi
 
 if [[ -e "$host_log" ]]; then

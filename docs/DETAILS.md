@@ -111,3 +111,6 @@ Sources: [PHP 21 October 2026 release](https://www.php.net/archive/2026.php#2026
 - Repeated `--workarounds` runs give the same files. The marked block is replaced, and blank lines do not pile up.
 - JSON output escapes every control character.
 - Ini parsing skips `[PATH=...]` and `[HOST=...]` sections, keeps `;` inside quotes, and treats `key =` as an empty value.
+- PATH: when it runs on a real host the script keeps only the standard system directories plus root-owned, non-writable entries of your PATH, so a writable directory in PATH cannot swap in a fake `apt-get` or `systemctl`.
+- For apt, if the changelog server has nothing for the candidate, the signed candidate package is downloaded with `apt-get download` and its changelog is read from it. Nothing is installed or run from that download.
+- `--fix` needs the network for the package manager, and `dnf` also reads the candidate changelog from repo metadata. The scan itself does not.
