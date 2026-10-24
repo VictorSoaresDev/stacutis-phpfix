@@ -1,89 +1,75 @@
 # Stacutis PHP2Shell scanner
 
-## Run this on the server
+A small bash script that checks a Linux server for PHP2Shell (CVE-2026-109618 / CVE-2026-109619) and, only if you say yes, fixes it.
 
-Paste this into the server's terminal. It downloads the scanner, checks the file, and scans. A scan changes nothing. If a menu appears, option 4 leaves the server as it is. An upgrade still waits for a separate yes.
+## Quick start
+
+Download, check, read, then run. Please don't pipe it into a shell.
 
 ```sh
-cd /tmp &&
-curl -fsSL -O https://raw.githubusercontent.com/VictorSoaresDev/stacutis-phpfix/main/stacutis-php2shell.sh &&
-curl -fsSL -O https://raw.githubusercontent.com/VictorSoaresDev/stacutis-phpfix/main/CHECKSUMS.txt &&
-sha256sum -c CHECKSUMS.txt &&
-bash stacutis-php2shell.sh
+cd /tmp
+curl -fsSL -o stacutis-php2shell.sh https://www.stacutis.com/php2shell.sh
+curl -fsSL -O https://www.stacutis.com/CHECKSUMS.txt
+sha256sum -c CHECKSUMS.txt       # must say: stacutis-php2shell.sh: OK
+less stacutis-php2shell.sh    # read it, it's plain bash
+bash stacutis-php2shell.sh    # scan only, changes nothing
 ```
 
-The check must print `stacutis-php2shell.sh: OK`. Read the script before you run it. Do not pipe the download into a shell.
+Official download: https://www.stacutis.com/php2shell.sh (same file as `stacutis-php2shell.sh` in this repo, SHA256 in `CHECKSUMS.txt`).
 
-This is a local tool for a Linux host you administer. It reports whether PHP on that host is exposed to [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp) (CVSS v4.0 9.2). Upstream fixes are PHP 8.5.12, 8.4.27, 8.3.36, and 8.2.35. Tool version 1.0.0. CVE data date 2026-10-22. If that date is more than 14 days behind the clock, read the PHP advisory again before you trust a PATCHED result.
+A checksum only proves the download wasn't broken. If you want more, compare it with the one in this repo and read the script. It's one file, no dependencies besides bash 4.3+.
 
-Provided as-is. Run it only on systems you own or administer. Take a backup before you answer yes. MIT license (`LICENSE`).
+## What it checks
 
-## Workaround tradeoffs
+- Every PHP it can find: CLI, PHP-FPM, mod_php, php-cgi, FrankenPHP, LiteSpeed lsphp.
+- Version against the fixed releases: 8.5.12, 8.4.27, 8.3.36, 8.2.35.
+- Your distro's package changelog, so backported fixes count as PATCHED.
+- Optional: `--ioc` looks for signs of exploitation in logs, `--containers` lists PHP-looking Docker containers.
 
-> [!CAUTION]
-> Temporary settings do not upgrade PHP. The vulnerable build stays installed. The next scan can say MITIGATED, and the exit code stays 1. PHP restarts and drops requests in flight. Settings are written as admin config, so the site cannot turn them back on with `.user.ini` or `ini_set`. Config is copied to `/var/backups/stacutis/<stamp>/`. `--rollback <stamp>` restores those files and restarts the recorded services. It does not change packages.
+The scan is read-only, works without root, uses no network and sends nothing anywhere.
 
-On a terminal the same tradeoffs are printed in red before each yes.
+## What it changes
 
-| You turn on | What you give up |
+Nothing, unless you pass one of these flags **and** answer `y` (or add `--yes`). Add `--dry-run` to any of them to see the plan without writing anything.
+
+| Option | Touches | Undo |
+| --- | --- | --- |
+| `--fix` | Upgrades installed PHP packages with your package manager (`apt-get install --only-upgrade`, `dnf/yum upgrade`, `apk upgrade`), same branch only. Restarts PHP-FPM / Apache so workers load the new code. No new repos, no compiling. | A normal package downgrade, if you really need one. |
+| `--workarounds` | Writes `<php conf.d>/99-stacutis-php2shell.ini`, adds a marked `stacutis-php2shell` block to vulnerable FPM pool files, and on mod_php hosts writes `/etc/apache2/conf-available/stacutis-php2shell.conf` (+ `conf-enabled` link) or `/etc/httpd/conf.d/stacutis-php2shell.conf`. Restarts those services. | `--rollback <stamp>` (see below). |
+| `--log` | Appends one line to `/var/log/stacutis-php2shell.log`. | Delete the file. |
+
+Workarounds are temporary, not a fix. By default they only turn off `session.upload_progress` (and fatal error backtraces on 8.5). Smaller post/upload limits, `memory_limit=-1` and `pm.max_requests=1` each need their own flag because they can break things. Tradeoffs are printed in red before each prompt; full list in [docs/DETAILS.md](docs/DETAILS.md#workaround-tradeoffs).
+
+## Undo
+
+Before any workaround is written, the touched files are copied to `/var/backups/stacutis/<stamp>/` (stamp looks like `20261022T153000Z`).
+
+```sh
+ls /var/backups/stacutis/
+sudo bash stacutis-php2shell.sh --rollback 20261022T153000Z
+```
+
+That restores the files and restarts the services it had restarted. Package upgrades are not rolled back.
+
+## Options
+
+| Flag | What it does |
 | --- | --- |
-| Upload progress off | Bars that use `PHP_SESSION_UPLOAD_PROGRESS` stop. This closes one confirmed path. Other ways into the bug stay open. |
-| Fatal backtraces off (PHP 8.5) | Fatal errors lose that backtrace. This blocks one confirmed producer of the stale-state bug. |
-| Post 8M / upload 2M, or post 32M / upload 8M | Larger forms, APIs, and file uploads fail. 8M and 32M are the advisory's post sizes. 2M and 8M are this tool's smaller upload caps. The proxy and any WAF are not edited. |
-| `memory_limit=-1` | PHP stops capping RAM. One request can grow until the cgroup limit or the OS OOM killer. An allocation failure can still reach the bug. Pair it with a cgroup `memory.max`. This tool never sets `RLIMIT_AS` or `RLIMIT_DATA`. Written only in FPM and Apache admin blocks, not the shared ini drop-in. |
-| `pm.max_requests=1` | Every FPM worker exits after one request. Under load that costs CPU, adds latency, and can fill the listen queue. |
+| *(none)* | Read-only scan |
+| `--fix` | Upgrade PHP packages (asks first) |
+| `--workarounds` | Temporary settings (asks first) |
+| `--upload-policy none\|uploads` | With workarounds: post 8M/upload 2M, or 32M/8M |
+| `--allow-unlimited-memory` | With workarounds: `memory_limit=-1` |
+| `--max-requests-1` | With workarounds: `pm.max_requests=1` |
+| `--rollback STAMP` | Restore a workaround backup |
+| `--dry-run` | Show what would change, write nothing |
+| `--yes` | Say yes to the action you picked (doesn't pick one for you) |
+| `--ioc` / `--containers` / `--containers-exec` | Extra read-only checks |
+| `--json` / `--quiet` / `--no-color` / `--log` | Output options |
+| `--help` / `--version` | |
 
-`--workarounds --yes` applies only the first two. Post size needs `--upload-policy none` or `--upload-policy uploads`. The RAM cap needs `--allow-unlimited-memory`. One-request workers need `--max-requests-1`. Each of those stays off unless you pass the flag.
+Exit codes: 0 patched or no PHP, 1 vulnerable or only mitigated, 2 bad usage, 3 unknown, 4 change failed, 5 needs root.
 
-## Scan and upgrade
+## License and credits
 
-The default run is read-only and does not use the network. It finds CLI `php`, PHP-FPM, `mod_php`, php-cgi, FrankenPHP, and LiteSpeed `lsphp`, and it reads the local package changelog only. PATCHED (backport) needs both CVE IDs on lines that are not not-affected, wontfix, no-dsa, unfixed, or ignored. This tool rates `mod_php` highest risk because [GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) shows code execution when `mod_php` runs shutdown after a failed startup. That GHSA also says a complete PHP-FPM exploit was not demonstrated for that CVE. PHP 8.1 and older stay vulnerable unless the local changelog names both CVEs.
-
-`--fix` upgrades with apt, dnf, yum, or apk, and only a same-branch candidate at or above the fixed release, or one whose changelog names both CVEs. It does not compile PHP, does not add repositories, and does not move 8.1 and older to a new major version. Ondrej's PPA and remi are named only as archives a host may already use. The tool will not enable them.
-
-`--ioc` and `--containers` are optional and read-only. Indicators are not proof, and the published AWS addresses are not blocked: `103.216.220.92`, `31.223.184.166`, `37.19.200.5`, `134.209.159.64`, `103.114.163.188`, `95.217.98.37`. The tool does not patch containers.
-
-Needs bash 4.3 or newer. On Alpine, install bash first. A scan works without root. `--fix`, `--workarounds`, and `--rollback` need root, except `--dry-run` and `--test-root`.
-
-## Flags
-
-| Flag | Effect |
-| --- | --- |
-| `--json` | One JSON document on stdout. `schema_version` is 1. |
-| `--quiet` | One summary line. |
-| `--no-color` | Plain text. Also plain when stdout is not a terminal, `NO_COLOR` is set, or `--json` is set. |
-| `--dry-run` | Show the plan and write nothing. A vulnerable host still exits 1. |
-| `--yes` | Answer yes to an action you already named. It does not choose the action. |
-| `--fix` | Upgrade when the repo has a confirmed fix. |
-| `--workarounds` | Apply temporary settings. See the tradeoffs above. |
-| `--upload-policy none\|uploads` | With `--workarounds`, set the post and upload caps above. |
-| `--allow-unlimited-memory` | With `--workarounds`, lock `memory_limit=-1`. |
-| `--max-requests-1` | With `--workarounds`, set `pm.max_requests=1`. |
-| `--ioc` | Read-only indicators since 2026-10-17. Does not change the exit code. |
-| `--containers` | List local Docker containers that look like PHP. |
-| `--containers-exec` | With `--containers`, run `php -v` inside them. |
-| `--log` | Append the scan summary to `/var/log/stacutis-php2shell.log` (mode 600). A scan does not create that file otherwise. |
-| `--rollback STAMP` | Restore `/var/backups/stacutis/STAMP`. The stamp looks like `20261022T153000Z`. |
-| `--test-root DIR` | Fixture mode. `DIR` must contain `fixture/IS_TEST_ROOT`. |
-| `--version` / `--help` | Version and CVE data date, or usage. |
-
-`--fix` and `--workarounds` cannot be combined. `--rollback` cannot be combined with either.
-
-| Code | Meaning |
-| --- | --- |
-| 0 | No PHP, or every finding is PATCHED. |
-| 1 | At least one finding is VULNERABLE or MITIGATED. |
-| 2 | Bad usage. |
-| 3 | UNKNOWN only. If any finding is vulnerable, the code is 1. |
-| 4 | A requested change failed. |
-| 5 | A change needs root. |
-
-Exit 0 does not mean the host was checked for a past break-in.
-
-## Check the file
-
-`sha256sum -c CHECKSUMS.txt` must print `stacutis-php2shell.sh: OK`. That check catches a broken download. It does not catch a replaced repository, because both files would change together. This tree has no signing key. Sign with `gpg --detach-sign --armor` or `minisign -Sm`, and publish the public key on a second channel.
-
-`bash tests/run-hermetic.sh` runs the fixture suite. The Docker image suite was not executed in the environment that produced this tree.
-
-Sources: [PHP 21 October 2026 release](https://www.php.net/archive/2026.php#2026-10-21-5), [PHP Foundation](https://thephp.foundation/blog/2026/10/21/todays-php-security-release-and-how-were-strengthening-php-security/), [oss-security](https://openwall.com/lists/oss-security/2026/10/21/6), [CERT-EU 2026-018](https://www.cert.europa.eu/publications/security-advisories/2026-018/), [Canadian Centre AL26-026](https://www.cyber.gc.ca/en/alerts-advisories/al26-026-critical-vulnerabilities-impacting-php-cve-2026-109618-cve-2026-109619), [AWS MadPot](https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/), [AWS WAF](https://aws.amazon.com/blogs/security/using-aws-waf-to-apply-mitigations-for-php2shell-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619/).
+MIT, see `LICENSE`. Provided as-is; run it only on servers you administer and keep a backup. Built by Victor Soares ([Stacutis](https://www.stacutis.com)). Advisory sources and the deep details are in [docs/DETAILS.md](docs/DETAILS.md). Tests: `bash tests/run-hermetic.sh`.

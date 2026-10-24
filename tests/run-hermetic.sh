@@ -740,7 +740,258 @@ if want "rhel-note"; then
   assert_rc "rhel layout vulnerable" 1
 fi
 
+if want "c1-backport-owner"; then
+  # A patched distro package must not vouch for an unpackaged binary.
+  root=$(fixture_new)
+  keep "$root"
+  fixture_php_bin "$root/usr/bin/php8.2" "8.2.7"
+  fixture_add_pkg "$root" "php8.2-cli" "8.2.7-1~deb12u9" "/usr/bin/php8.2"
+  fixture_changelog "$root" "php8.2-cli" <<'CL'
+php8.2 (8.2.7-1~deb12u9) bookworm-security; urgency=medium
+  * CVE-2026-109618
+  * CVE-2026-109619
+CL
+  fixture_php_bin "$root/usr/local/bin/php" "8.2.10"
+  run_tool --json --test-root "$root"
+  assert_eq "c1 distro build backported" "$(finding 8.2.7 cli | cut -f1)" "PATCHED"
+  assert_eq "c1 unpackaged build vulnerable" "$(finding 8.2.10 cli | cut -f1)" "VULNERABLE"
+  assert_rc "c1 scan" 1
+fi
+
+if want "c2-no-exec-untrusted"; then
+  root=$(fixture_new)
+  keep "$root"
+  mkdir -p "$root/home/mallory" "$root/proc/4242"
+  cat >"$root/home/mallory/php-fpm8.3" <<EOF2
+#!/bin/sh
+# X-Powered-By: PHP/8.3.1
+touch "$root/MARKER"
+printf 'PHP 9.9.9 (cli)\n'
+EOF2
+  chmod 755 "$root/home/mallory/php-fpm8.3"
+  fixture_owner "$root" "/home/mallory/php-fpm8.3" 1000
+  ln -s "/home/mallory/php-fpm8.3" "$root/proc/4242/exe"
+  mkdir -p "$root/usr/local/bin"
+  cat >"$root/usr/local/bin/php" <<EOF2
+#!/bin/sh
+# X-Powered-By: PHP/8.2.11
+touch "$root/MARKER2"
+printf 'PHP 9.9.9 (cli)\n'
+EOF2
+  chmod 775 "$root/usr/local/bin/php"
+  run_tool --json --test-root "$root"
+  [[ ! -e "$root/MARKER" ]] && pass "c2 proc exe not run" || fail "c2 proc exe not run"
+  [[ ! -e "$root/MARKER2" ]] && pass "c2 group-writable not run" || fail "c2 group-writable not run"
+  assert_eq "c2 static version from user binary" "$(finding 8.3.1 fpm | cut -f1)" "VULNERABLE"
+  assert_eq "c2 static version from writable binary" "$(finding 8.2.11 cli | cut -f1)" "VULNERABLE"
+fi
+
+if want "h1-write-failure"; then
+  root=$(vuln_fpm)
+  confd="$root/etc/php/8.3/fpm/conf.d"
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  before=$(cksum <"$pool")
+  chmod 555 "$confd"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  chmod 755 "$confd"
+  assert_rc "h1 failed write" 4
+  [[ ! -e "$root/fixture/restarts.log" ]] && pass "h1 no restart after failed write" || fail "h1 no restart after failed write"
+  assert_eq "h1 pool untouched" "$(cksum <"$pool")" "$before"
+  [[ ! -e "$confd/99-stacutis-php2shell.ini" ]] && pass "h1 no drop-in left" || fail "h1 no drop-in left"
+fi
+
+if want "h2-configtest"; then
+  root=$(vuln_fpm)
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  before=$(cksum <"$pool")
+  printf 'ERROR: unknown entry\n' >"$root/fixture/configtest-fail"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_rc "h2 config test failure" 4
+  [[ ! -e "$root/fixture/restarts.log" ]] && pass "h2 no restart on bad config" || fail "h2 no restart on bad config"
+  assert_eq "h2 pool restored" "$(cksum <"$pool")" "$before"
+  [[ ! -e "$root/etc/php/8.3/fpm/conf.d/99-stacutis-php2shell.ini" ]] && pass "h2 drop-in removed" || fail "h2 drop-in removed"
+  grep -q 'test-root reload' "$RUN_ERR" "$RUN_OUT" && fail "h2 reload happened" || pass "h2 nothing reloaded"
+fi
+
+if want "h3-symlink-dropin"; then
+  root=$(vuln_fpm)
+  confd="$root/etc/php/8.3/fpm/conf.d"
+  mkdir -p "$root/etc/php/8.3/mods-available"
+  printf '; old\n' >"$root/etc/php/8.3/mods-available/stacutis.ini"
+  chmod 640 "$root/etc/php/8.3/mods-available/stacutis.ini"
+  ln -s ../../mods-available/stacutis.ini "$confd/99-stacutis-php2shell.ini"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  [[ -L "$confd/99-stacutis-php2shell.ini" ]] && pass "h3 symlink kept" || fail "h3 symlink kept"
+  grep -q 'session.upload_progress.enabled = 0' "$root/etc/php/8.3/mods-available/stacutis.ini" && pass "h3 target written" || fail "h3 target written"
+  assert_eq "h3 mode kept" "$(stat -c %a "$root/etc/php/8.3/mods-available/stacutis.ini")" "640"
+  leftover=$(find "$root/etc" -name '.stacutis-php2shell.*' | head -1)
+  assert_eq "h3 no temp files left" "$leftover" ""
+fi
+
+if want "h4-unique-stamp"; then
+  root=$(vuln_fpm)
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  orig=$(cksum <"$pool")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  n=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  assert_eq "h4 three runs three backups" "$n" "3"
+  first=$(find "$root/var/backups/stacutis" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | head -1)
+  run_tool --rollback "$first" --yes --test-root "$root"
+  assert_eq "h4 first rollback gives the original pool" "$(cksum <"$pool")" "$orig"
+fi
+
+if want "h5-other-namespace"; then
+  root=$(vuln_fpm)
+  mkdir -p "$root/proc/self/ns" "$root/proc/77/ns" "$root/proc/78/ns"
+  ln -s 'mnt:[4026531840]' "$root/proc/self/ns/mnt"
+  ln -s 'mnt:[4026532999]' "$root/proc/77/ns/mnt"
+  ln -s /usr/local/sbin/php-fpm "$root/proc/77/exe"
+  ln -s 'mnt:[4026531840]' "$root/proc/78/ns/mnt"
+  ln -s /usr/sbin/php-fpm8.3 "$root/proc/78/exe"
+  run_tool --json --test-root "$root"
+  assert_rc "h5 host scan" 1
+  n=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["other_namespace_processes"]), len(d["findings"]))' "$RUN_OUT")
+  assert_eq "h5 one foreign process, one host finding" "$n" "1 1"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  [[ ! -e "$root/usr/local/etc/php-fpm.d/99-stacutis-php2shell.ini" ]] && pass "h5 foreign not changed" || fail "h5 foreign not changed"
+fi
+
+if want "m1-panel-layout"; then
+  root=$(fixture_new)
+  keep "$root"
+  base="$root/opt/cpanel/ea-php83/root"
+  fixture_php_bin "$base/usr/sbin/php-fpm" "8.3.6"
+  mkdir -p "$base/etc/php.d" "$base/etc/php-fpm.d"
+  printf 'session.upload_progress.enabled = On\n' >"$base/etc/php.ini"
+  printf '[site]\nuser = site\n' >"$base/etc/php-fpm.d/site.conf"
+  printf 'ea-php83-php-fpm\n' >"$root/fixture/services"
+  run_tool --json --test-root "$root"
+  main=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["findings"][0]["session_upload_progress_source"])' "$RUN_OUT")
+  [[ "$main" == *"/opt/cpanel/ea-php83/root/etc/php.ini"* || "$main" == "ini" ]] && pass "m1 cpanel ini read" || fail "m1 cpanel ini read: $main"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  [[ -f "$base/etc/php.d/99-stacutis-php2shell.ini" ]] && pass "m1 cpanel drop-in" || fail "m1 cpanel drop-in"
+  grep -q 'stacutis-php2shell begin' "$base/etc/php-fpm.d/site.conf" && pass "m1 cpanel pool" || fail "m1 cpanel pool"
+  grep -qx 'ea-php83-php-fpm' "$root/fixture/restarts.log" && pass "m1 cpanel service" || fail "m1 cpanel service"
+fi
+
+if want "m2-symlinked-ini"; then
+  root=$(vuln_fpm)
+  mkdir -p "$root/etc/php/8.3/mods-available"
+  printf 'session.upload_progress.enabled = 0\n' >"$root/etc/php/8.3/mods-available/noprog.ini"
+  ln -s ../../mods-available/noprog.ini "$root/etc/php/8.3/fpm/conf.d/20-noprog.ini"
+  run_tool --json --test-root "$root"
+  assert_eq "m2 symlinked conf.d ini counts" "$(finding 8.3.6 fpm | cut -f1)" "MITIGATED"
+fi
+
+if want "m3-apache-enabled"; then
+  root=$(fixture_new)
+  keep "$root"
+  fixture_php_bin "$root/usr/bin/php8.3" "8.3.6"
+  mkdir -p "$root/usr/lib/apache2/modules" "$root/etc/apache2/conf-available" "$root/etc/apache2/conf-enabled" "$root/etc/php/8.3/apache2/conf.d"
+  printf '#!/bin/sh\n# X-Powered-By: PHP/8.3.6\n' >"$root/usr/lib/apache2/modules/libphp8.3.so"
+  printf 'session.upload_progress.enabled = On\n' >"$root/etc/php/8.3/apache2/php.ini"
+  printf 'php_admin_flag session.upload_progress.enabled Off\n' >"$root/etc/apache2/conf-available/off.conf"
+  printf ' php_module (shared)\n' >"$root/fixture/apache-modules"
+  printf 'apache2\n' >"$root/fixture/services"
+  run_tool --json --test-root "$root"
+  assert_eq "m3 disabled conf ignored" "$(finding 8.3.6 modphp | cut -f1)" "VULNERABLE"
+  finding 8.3.6 modphp >/dev/null && pass "m7 libphp version read" || fail "m7 libphp version read"
+  ln -s ../conf-available/off.conf "$root/etc/apache2/conf-enabled/off.conf"
+  run_tool --json --test-root "$root"
+  assert_eq "m3 enabled conf counts" "$(finding 8.3.6 modphp | cut -f1)" "MITIGATED"
+  rm "$root/etc/apache2/conf-enabled/off.conf"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  grep -q '<IfModule php7_module>' "$root/etc/apache2/conf-available/stacutis-php2shell.conf" && pass "m3 php7 block" || fail "m3 php7 block"
+fi
+
+if want "m4-no-changelog"; then
+  root=$(vuln_fpm)
+  run_tool --json --test-root "$root"
+  note=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([f["note"] for f in d["findings"] if f["sapi"]=="fpm"][0])' "$RUN_OUT")
+  [[ "$note" == *"could not be checked"* ]] && pass "m4 missing changelog note" || fail "m4 missing changelog note: $note"
+fi
+
+if want "m5-held"; then
+  root=$(vuln_fpm)
+  printf 'php8.3-fpm\t8.3.36-1\n' >"$root/fixture/candidates.tsv"
+  printf 'php8.3-fpm\n' >"$root/fixture/held"
+  run_tool --fix --yes --test-root "$root"
+  grep -qi 'held by the package manager' "$RUN_OUT" "$RUN_ERR" && pass "m5 hold respected" || fail "m5 hold respected"
+  grep -q 'PHP 8.3.6' "$root/usr/sbin/php-fpm8.3" && pass "m5 held binary unchanged" || fail "m5 held binary unchanged"
+fi
+
+if want "m6-affected-only"; then
+  root=$(vuln_fpm)
+  fixture_php_bin "$root/usr/sbin/php-fpm8.2" "8.2.35"
+  fixture_add_pkg "$root" "php8.2-fpm" "8.2.35-1" "/usr/sbin/php-fpm8.2"
+  fixture_fpm_tree "$root" "8.2"
+  printf 'php8.3-fpm\nphp8.2-fpm\napache2\n' >"$root/fixture/services"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_eq "m6 only the vulnerable branch restarts" "$(tr '\n' ' ' <"$root/fixture/restarts.log")" "php8.3-fpm "
+fi
+
+if want "m8-outbound"; then
+  root=$(vuln_fpm)
+  mkdir -p "$root/proc/net"
+  printf 'www-data:x:33:33::/var/www:/usr/sbin/nologin\n' >"$root/etc/passwd"
+  cat >"$root/proc/net/tcp" <<'EOF2'
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0 100 0 0 10 0
+   1: 0100007F:0050 0A000002:C350 01 00000000:00000000 00:00000000 00000000    33        0 2 1 0 100 0 0 10 0
+   2: 0100007F:D431 5DDCD867:01BB 01 00000000:00000000 00:00000000 00000000    33        0 3 1 0 100 0 0 10 0
+EOF2
+  run_tool --json --ioc --test-root "$root"
+  out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("|".join(d["ioc"]["outbound"]))' "$RUN_OUT")
+  [[ "$out" == *"5DDCD867:01BB"* && "$out" != *"0A000002:C350"* ]] && pass "m8 outbound only" || fail "m8 outbound only: $out"
+fi
+
 host_log_after="absent"
+if want "l2-idempotent-block"; then
+  root=$(vuln_fpm)
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  f=$(find "$root/etc" -name '99-stacutis-php2shell.ini' | head -1)
+  a=$(cksum <"$f")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_eq "l2 repeated runs give the same file" "$(cksum <"$f")" "$a"
+  pool="$root/etc/php/8.3/fpm/pool.d/www.conf"
+  b=$(grep -c '^$' "$pool")
+  run_tool --workarounds --yes --upload-policy none --test-root "$root"
+  assert_eq "l2 pool blank lines do not grow" "$(grep -c '^$' "$pool")" "$b"
+fi
+
+if want "l3-json-control"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^json_escape()/,/^}/p' "$SCRIPT")
+  assert_eq "l3 control chars escaped" "$(json_escape $'a\x01b\x1bc')" 'a\u0001b\u001bc'
+  if command -v python3 >/dev/null 2>&1; then
+    printf '"%s"' "$(json_escape $'x\x02\ty"\\')" | python3 -c 'import json,sys; json.load(sys.stdin)' && pass "l3 valid json" || fail "l3 valid json"
+  fi
+fi
+
+if want "l5-ini-sections"; then
+  # shellcheck disable=SC1090
+  source <(sed -n '/^ini_key_value()/,/^}/p' "$SCRIPT")
+  ini=$(mktemp)
+  printf 'a = 1\nb = "x;y" ; note\nc =\n[PATH=/var/www]\na = 9\n[PHP]\nd = 4 ; c\n' >"$ini"
+  ini_key_value a "$ini"; assert_eq "l5 PATH section ignored" "$INI_VALUE" "1"
+  ini_key_value b "$ini"; assert_eq "l5 quoted semicolon kept" "$INI_VALUE" "x;y"
+  ini_key_value c "$ini"; assert_eq "l5 empty value found" "$INI_FOUND:$INI_VALUE" "1:"
+  ini_key_value d "$ini"; assert_eq "l5 inline comment stripped" "$INI_VALUE" "4"
+  rm -f "$ini"
+fi
+
+if want "l1-nonroot-warning"; then
+  if [[ "$(id -u)" -ne 0 ]]; then
+    out=$(bash "$SCRIPT" --json 2>&1 >/dev/null || true)
+    [[ "$out" == *"not running as root"* ]] && pass "l1 warning shown" || fail "l1 warning shown"
+  else
+    pass "l1 skipped as root"
+  fi
+fi
+
 if [[ -e "$host_log" ]]; then
   host_log_after=$(cksum "$host_log" | awk '{print $1, $2}')
 fi

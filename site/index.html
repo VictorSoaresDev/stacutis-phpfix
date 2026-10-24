@@ -78,11 +78,11 @@
     <p class="warn">Read the script before you run it. Do not pipe the download into a shell. The program is provided as-is. Take a backup before you answer yes to a change.</p>
 
     <div class="actions">
-      <a class="button" href="https://stacutis.com/php2shell.sh">Download php2shell.sh</a>
+      <a class="button" href="https://www.stacutis.com/php2shell.sh" download="stacutis-php2shell.sh">Download php2shell.sh</a>
       <a class="button" href="../stacutis-php2shell.sh">View the source</a>
-      <a class="button" href="../CHECKSUMS.txt">Checksums</a>
+      <a class="button" href="https://www.stacutis.com/CHECKSUMS.txt">Checksums</a>
     </div>
-    <p class="meta">The button uses the public URL. The source link is the file in this tree, <code>stacutis-php2shell.sh</code>. A GitHub release URL is not hardcoded here. When you publish a release, point the button at that release and keep this checksum on stacutis.com as well.</p>
+    <p class="meta">The button uses the public URL. The source link is the file in this tree, <code>stacutis-php2shell.sh</code>. A GitHub release URL is not hardcoded here. When you publish a release, point the button at that release and keep this checksum on www.stacutis.com as well.</p>
 
     <h2>What it is</h2>
     <p>Hitting <code>memory_limit</code> can abort PHP with <code>longjmp()</code> while request memory is only partly initialized (CVE-2026-109618). A fatal error at the wrong moment can leave global state pointing at freed memory for the next request on the same worker (CVE-2026-109619). The session upload-progress handler is on by default. On PHP 8.5, fatal-error backtraces are another confirmed path. Details and the disagreement between the PHP-FPM write-ups are in the <a href="../README.md">README</a>.</p>
@@ -98,11 +98,13 @@
 
     <h2>Check the file</h2>
     <p>SHA-256 of <code>stacutis-php2shell.sh</code>:</p>
-    <pre>539a70e4a30ff959343c6e0f3fce1ad16521d3717702724688437b9437b73379</pre>
-    <pre>curl -fsSL https://stacutis.com/php2shell.sh -o php2shell.sh
-less php2shell.sh
+    <pre>1a4492c431ac9254073eecd76403a112b1d32de16ada3e87dc64595808d2d7e4</pre>
+    <pre>curl -fsSL -o stacutis-php2shell.sh https://www.stacutis.com/php2shell.sh
+curl -fsSL -O https://www.stacutis.com/CHECKSUMS.txt
 sha256sum -c CHECKSUMS.txt
-sudo bash php2shell.sh</pre>
+less stacutis-php2shell.sh
+sudo bash stacutis-php2shell.sh</pre>
+    <p>Save the file as <code>stacutis-php2shell.sh</code>. That is the name <code>CHECKSUMS.txt</code> checks.</p>
     <p>A checksum matters only if you got it from a path you trust. This tree does not include a signing key. When the publisher signs a release, check that signature with a public key that arrived somewhere else.</p>
     <pre>gpg --verify stacutis-php2shell.sh.asc stacutis-php2shell.sh
 minisign -Vm stacutis-php2shell.sh -p stacutis.pub</pre>

@@ -1,8 +1,28 @@
 #!/usr/bin/env bash
-# stacutis-php2shell — scan a Linux host for PHP2Shell and, only after a
-# yes, upgrade PHP with the distro package manager or apply temporary
-# settings. It does not scan other hosts, does not send telemetry, and
-# does not compile PHP.
+# stacutis-php2shell: scan a Linux host for PHP2Shell
+# (CVE-2026-109618 / CVE-2026-109619) and, only if you say yes, fix it.
+#
+# What it reads (default, scan only):
+#   - php / php-fpm / php-cgi / lsphp / frankenphp binaries and their -v output
+#   - PHP ini files, FPM pool configs, Apache config (to spot mod_php)
+#   - the local package database and package changelogs (dpkg, rpm, apk)
+#   - with --ioc: web and PHP logs; with --containers: docker ps
+#
+# What it may change (only with --fix, --workarounds or --rollback, and only
+# after you answer y, or pass --yes):
+#   --fix          upgrades installed PHP packages with apt/dnf/yum/apk,
+#                  then restarts PHP-FPM / Apache so workers load the new code
+#   --workarounds  writes <php conf.d>/99-stacutis-php2shell.ini, adds a
+#                  marked block to vulnerable FPM pool files, and on mod_php
+#                  hosts writes stacutis-php2shell.conf in the Apache config
+#                  dir; backs up first to /var/backups/stacutis/<stamp>/ and
+#                  restarts the affected services
+#   --rollback     restores a backup made by --workarounds
+#   --log          appends one summary to /var/log/stacutis-php2shell.log
+#
+# What it never does: send data anywhere, phone home, add repositories,
+# compile PHP, or touch other hosts. The scan itself does not use the network.
+# --dry-run shows what a change would do without writing anything.
 #
 # Provided as-is. Run it only on systems you own or administer, and take
 # a backup before you answer yes to a change.
@@ -12,6 +32,8 @@
 # CVE-2026-109618  CVE-2026-109619
 # Fixed upstream: 8.5.12, 8.4.27, 8.3.36, 8.2.35
 # https://www.php.net/archive/2026.php#2026-10-21-5
+
+# --- settings and state (nothing below runs until main at the bottom) ---
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -116,7 +138,7 @@ WATCHED_IPS=(
 
 usage() {
   cat <<'EOF'
-stacutis-php2shell — local PHP2Shell scanner and patch helper
+stacutis-php2shell: local PHP2Shell scanner and patch helper
 
 Usage:
   stacutis-php2shell.sh [options]
@@ -262,7 +284,7 @@ tradeoff() {
 }
 
 workaround_banner() {
-  local line="${RED}${BOLD}These settings leave the vulnerable PHP installed. MITIGATED is still vulnerable. PHP restarts and drops requests in flight.${RESET}"
+  local line="${RED}${BOLD}These settings leave the vulnerable PHP installed. MITIGATED is still vulnerable. The config is tested first, then PHP is reloaded. If a reload is not possible it restarts, which drops requests in flight.${RESET}"
   if [[ "$JSON" -eq 1 || "$QUIET" -eq 1 ]]; then
     printf '%s\n' "$line" >&2
     return 0
@@ -310,6 +332,17 @@ json_escape() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
+  if [[ "$s" == *[$'\x01'-$'\x1f'$'\x7f']* ]]; then
+    local out="" c i
+    for ((i = 0; i < ${#s}; i++)); do
+      c=${s:i:1}
+      case "$c" in
+        [$'\x01'-$'\x1f'$'\x7f']) printf -v c '\\u%04x' "'$c" ;;
+      esac
+      out+=$c
+    done
+    s=$out
+  fi
   printf '%s' "$s"
 }
 
@@ -436,7 +469,7 @@ parse_args() {
       die_usage "post-size, memory, and max-requests flags belong with --workarounds"
     fi
   fi
-  if [[ -n "$ROLLBACK" && ! "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+  if [[ -n "$ROLLBACK" && ! "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z(-[0-9]+)?$ ]]; then
     die_usage "--rollback timestamp must look like 20261022T153000Z"
   fi
   if [[ -n "$TEST_ROOT" ]]; then
@@ -541,6 +574,8 @@ classify_result() {
     note="partial-changelog"
   elif [[ "$backport" == "unchecked" ]]; then
     note="no-changelog"
+  elif [[ "$backport" == "missing" ]]; then
+    note="changelog-not-installed"
   elif [[ "$backport" == "none" ]]; then
     note="changelog-without-cve"
   fi
@@ -637,7 +672,7 @@ explicit_off() {
   return 1
 }
 
-# --- os, packages, changelogs ---
+# --- os, packages, changelogs (read-only) ---
 
 parse_os_release() {
   local f line
@@ -713,6 +748,23 @@ php_binary_kind() {
   printf '\n'
 }
 
+# Temp files go in one private directory that is removed on exit, even when
+# the run stops early.
+WORK_TMP=""
+tmpfile() {
+  if [[ -z "$WORK_TMP" || ! -d "$WORK_TMP" ]]; then
+    mktemp
+    return
+  fi
+  mktemp "$WORK_TMP/t.XXXXXX"
+}
+
+cleanup_tmp() {
+  if [[ -n "$WORK_TMP" && -d "$WORK_TMP" ]]; then
+    rm -rf -- "$WORK_TMP"
+  fi
+}
+
 run_limited() {
   if command -v timeout >/dev/null 2>&1; then
     timeout 10 "$@"
@@ -721,20 +773,81 @@ run_limited() {
   fi
 }
 
+# Owner uid of a path. In --test-root, fixture/owners can pretend a file
+# belongs to someone else ("<logical path> <uid>" per line).
+path_owner() {
+  local p=$1 logical line lp uid
+  if [[ -n "$TEST_ROOT" ]]; then
+    logical=${p#"$TEST_ROOT"}
+    if [[ -r "$TEST_ROOT/fixture/owners" ]]; then
+      while IFS=' ' read -r lp uid || [[ -n "$lp" ]]; do
+        if [[ "$lp" == "$logical" ]]; then
+          printf '%s\n' "$uid"
+          return 0
+        fi
+      done <"$TEST_ROOT/fixture/owners"
+    fi
+    printf '0\n'
+    return 0
+  fi
+  stat -c %u -- "$p" 2>/dev/null
+}
+
+# A binary is run (for -v) only when root owns it and nobody else can write
+# it or any directory above it. Anything else could be a planted program,
+# and this scan usually runs as root.
+trusted_to_run() {
+  local real d owner mode
+  real=$(readlink -f -- "$1" 2>/dev/null) || return 1
+  [[ -n "$real" && -f "$real" ]] || return 1
+  d=$real
+  while :; do
+    owner=$(path_owner "$d") || return 1
+    mode=$(stat -c %a -- "$d" 2>/dev/null) || return 1
+    [[ "$owner" == "0" ]] || return 1
+    if (( (8#$mode & 8#022) != 0 )); then
+      return 1
+    fi
+    if [[ "$d" == "/" || ( -n "$TEST_ROOT" && "$d" == "$TEST_ROOT" ) ]]; then
+      break
+    fi
+    d=$(dirname -- "$d")
+  done
+  return 0
+}
+
+# Read the version a PHP build carries without running it. PHP embeds
+# "X-Powered-By: PHP/<version>" in every SAPI binary and in libphp.so.
+static_php_version() {
+  local f=$1 hit
+  [[ -r "$f" ]] || return 1
+  hit=$(LC_ALL=C grep -aoE -m1 'X-Powered-By: PHP/[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.~+-]*' -- "$f" 2>/dev/null | head -n 1 || true)
+  [[ -n "$hit" ]] || return 1
+  printf 'PHP %s\n' "${hit#X-Powered-By: PHP/}"
+}
+
 php_version_text_of() {
   local bin=$1 out
-  out=$(run_limited "$bin" -v 2>&1 || true)
+  if ! trusted_to_run "$bin"; then
+    static_php_version "$bin" || true
+    return 0
+  fi
+  out=$(run_limited "$bin" -v 2>&1 </dev/null || true)
   if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
     printf '%s\n' "$out"
     return 0
   fi
-  out=$(run_limited "$bin" version 2>&1 || true)
+  out=$(run_limited "$bin" version 2>&1 </dev/null || true)
   if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
     printf '%s\n' "$out"
     return 0
   fi
-  out=$(run_limited "$bin" php-cli -v 2>&1 || true)
-  printf '%s\n' "$out"
+  out=$(run_limited "$bin" php-cli -v 2>&1 </dev/null || true)
+  if printf '%s\n' "$out" | awk 'BEGIN{e=1} /^PHP /{e=0} END{exit e}'; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  static_php_version "$bin" || printf '%s\n' "$out"
 }
 
 append_changelog_file() {
@@ -748,55 +861,35 @@ append_changelog_file() {
   printf '\n' >>"$dest"
 }
 
+# Changelog evidence comes only from the package that owns the binary being
+# classified. A changelog from another package in the same series says
+# nothing about a hand-built or leftover binary.
 collect_changelog_text() {
   local major=$1 minor=$2 pkg=$3 dest=$4
-  local dotted="${major}.${minor}" compact="${major}${minor}"
-  local base dir doc rp
+  local rp
   : >"$dest"
-  if [[ -n "$pkg" && "$pkg" != "unknown" ]]; then
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog.Debian.gz")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog.Debian")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/usr/share/doc/${pkg}/changelog")
-    append_changelog_file "$rp" "$dest"
-    rp=$(rootp "/fixture/changelogs/${pkg}")
-    append_changelog_file "$rp" "$dest"
-  fi
-  dir=$(rootp /usr/share/doc)
-  if [[ -d "$dir" ]]; then
-    for base in "$dir"/*; do
-      [[ -d "$base" ]] || continue
-      local name
-      name=$(basename "$base")
-      case "$name" in
-        "php${dotted}"|"php${dotted}-"*|"php${compact}"|"php${compact}-"*|"php-${dotted}"|"php-${dotted}-"*)
-          for doc in "$base"/changelog.Debian.gz "$base"/changelog.Debian "$base"/changelog "$base"/changelog.gz; do
-            append_changelog_file "$doc" "$dest"
-          done
-          ;;
-      esac
-    done
-  fi
-  if [[ -z "$TEST_ROOT" && -n "$pkg" && "$pkg" != "unknown" ]]; then
-    if command -v rpm >/dev/null 2>&1; then
-      rpm -q --changelog "$pkg" >>"$dest" 2>/dev/null || true
-    fi
+  [[ -n "$pkg" && "$pkg" != "unknown" ]] || return 0
+  for rp in "/usr/share/doc/${pkg}/changelog.Debian.gz" "/usr/share/doc/${pkg}/changelog.Debian" \
+    "/usr/share/doc/${pkg}/changelog.gz" "/usr/share/doc/${pkg}/changelog" "/fixture/changelogs/${pkg}"; do
+    append_changelog_file "$(rootp "$rp")" "$dest"
+  done
+  if [[ -z "$TEST_ROOT" ]] && command -v rpm >/dev/null 2>&1; then
+    rpm -q --changelog "$pkg" >>"$dest" 2>/dev/null || true
   fi
 }
 
 backport_state_for() {
   local major=$1 minor=$2 pkg=$3
   local tmp state
-  if [[ -z "$major" || -z "$minor" ]]; then
+  if [[ -z "$major" || -z "$minor" || -z "$pkg" || "$pkg" == "unknown" ]]; then
     printf '%s\n' "unchecked"
     return 0
   fi
-  tmp=$(mktemp)
+  tmp=$(tmpfile)
   collect_changelog_text "$major" "$minor" "$pkg" "$tmp"
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
-    printf '%s\n' "unchecked"
+    printf '%s\n' "missing"
     return 0
   fi
   state=$(cve_state_file "$tmp")
@@ -865,7 +958,7 @@ pkg_of_path() {
   fi
 }
 
-# --- config ---
+# --- config parsing (read-only) ---
 
 list_ini_files() {
   local main=$1 dropin=$2
@@ -880,7 +973,7 @@ list_ini_files() {
     rp=$(rootp "$dropin")
     if [[ -d "$rp" ]]; then
       local sorted=""
-      sorted=$(find "$rp" -maxdepth 1 -type f -name '*.ini' 2>/dev/null | sort || true)
+      sorted=$(find -L "$rp" -maxdepth 1 -type f -name '*.ini' 2>/dev/null | sort || true)
       if [[ -n "$sorted" ]]; then
         while IFS= read -r extra; do
           [[ -n "$extra" ]] || continue
@@ -894,23 +987,40 @@ list_ini_files() {
 ini_key_value() {
   local key=$1
   shift
-  local f line k v val found=0
+  local f line k v val found=0 scoped
   INI_FOUND=0
   INI_VALUE=""
   for f in "$@"; do
     [[ -f "$f" && -r "$f" ]] || continue
+    scoped=0
     while IFS= read -r line || [[ -n "$line" ]]; do
-      line=${line%%;*}
-      line=$(trim "$line")
-      [[ -z "$line" ]] && continue
-      [[ "$line" == \[* ]] && continue
+      # Inline trim: no subshell per line.
+      line=${line#"${line%%[![:space:]]*}"}
+      [[ -z "$line" || "$line" == \;* ]] && continue
+      if [[ "$line" == \[* ]]; then
+        # [PATH=...] and [HOST=...] apply only to some requests.
+        case "${line^^}" in
+          "[PATH="*|"[HOST="*) scoped=1 ;;
+          *) scoped=0 ;;
+        esac
+        continue
+      fi
+      [[ "$scoped" -eq 1 ]] && continue
       [[ "$line" == *"="* ]] || continue
-      k=$(trim "${line%%=*}")
-      v=$(trim "${line#*=}")
-      v=${v#\"}
-      v=${v%\"}
-      v=${v#\'}
-      v=${v%\'}
+      k=${line%%=*}
+      k=${k%"${k##*[![:space:]]}"}
+      v=${line#*=}
+      v=${v#"${v%%[![:space:]]*}"}
+      if [[ "$v" == \"* ]]; then
+        v=${v#\"}
+        v=${v%%\"*}
+      elif [[ "$v" == \'* ]]; then
+        v=${v#\'}
+        v=${v%%\'*}
+      else
+        v=${v%%;*}
+        v=${v%"${v##*[![:space:]]}"}
+      fi
       if [[ "$k" == "$key" ]]; then
         val=$v
         found=1
@@ -923,8 +1033,10 @@ ini_key_value() {
   fi
 }
 
+# locate_layout MAJOR MINOR SAPI [BINARY]. Panel builds (cPanel, Plesk,
+# CloudLinux) are tried first when the binary lives under their prefix.
 locate_layout() {
-  local major=$1 minor=$2 sapi=$3
+  local major=$1 minor=$2 sapi=$3 bin=${4:-}
   local dotted="${major}.${minor}" compact="${major}${minor}" sapi_dir
   LOC_MAIN=""
   LOC_DROPIN=""
@@ -937,10 +1049,18 @@ locate_layout() {
     *) sapi_dir="cli" ;;
   esac
   local rows=()
+  local cp="/opt/cpanel/ea-php${compact}/root/etc" pl="/opt/plesk/php/${dotted}/etc" alt="/opt/alt/php${compact}/etc"
+  case "$bin" in
+    /opt/cpanel/ea-php"${compact}"/*) rows+=("${cp}/php.ini|${cp}/php.d|${cp}/php-fpm.d") ;;
+    /opt/plesk/php/"${dotted}"/*) rows+=("${pl}/php.ini|${pl}/php.d|${pl}/php-fpm.d") ;;
+    /opt/alt/php"${compact}"/*) rows+=("${alt}/php.ini|${alt}/php.d|${alt}/php-fpm.d") ;;
+    /usr/local/*) rows+=("/usr/local/etc/php/php.ini|/usr/local/etc/php/conf.d|/usr/local/etc/php-fpm.d") ;;
+  esac
   rows+=("/etc/php/${dotted}/${sapi_dir}/php.ini|/etc/php/${dotted}/${sapi_dir}/conf.d|/etc/php/${dotted}/fpm/pool.d")
   rows+=("/etc/php${compact}/php.ini|/etc/php${compact}/conf.d|/etc/php${compact}/php-fpm.d")
   rows+=("/etc/opt/remi/php${compact}/php.ini|/etc/opt/remi/php${compact}/php.d|/etc/opt/remi/php${compact}/php-fpm.d")
   rows+=("/etc/php.ini|/etc/php.d|/etc/php-fpm.d")
+  rows+=("/usr/local/etc/php/php.ini|/usr/local/etc/php/conf.d|/usr/local/etc/php-fpm.d")
   local row main drop pools
   for row in "${rows[@]}"; do
     IFS='|' read -r main drop pools <<<"$row"
@@ -960,6 +1080,25 @@ locate_layout() {
     fi
   done
   return 1
+}
+
+# Last resort for a layout this tool does not know: ask a trusted CLI binary
+# where its ini files are. Never used in --test-root.
+php_ini_layout() {
+  local bin=$1 kind=$2 outp main drop
+  [[ -z "$TEST_ROOT" && ( "$kind" == "cli" || "$kind" == "cgi" ) ]] || return 1
+  trusted_to_run "$bin" || return 1
+  outp=$(run_limited "$bin" --ini </dev/null 2>/dev/null) || return 1
+  main=$(printf '%s\n' "$outp" | awk -F': *' '/^Loaded Configuration File/ {print $2; exit}')
+  drop=$(printf '%s\n' "$outp" | awk -F': *' '/^Scan for additional .ini files in/ {print $2; exit}')
+  [[ "$main" == "(none)" ]] && main=""
+  [[ "$drop" == "(none)" ]] && drop=""
+  drop=${drop%%:*}
+  [[ -n "$main" || -n "$drop" ]] || return 1
+  LOC_MAIN=$main
+  LOC_DROPIN=$drop
+  LOC_POOLS=""
+  return 0
 }
 
 pool_files_in() {
@@ -1203,18 +1342,32 @@ fill_config_at() {
   fi
 }
 
+# Apache files that are actually loaded. On Debian that is apache2.conf and
+# the *-enabled directories, which hold symlinks. On RHEL it is conf/,
+# conf.d/ and conf.modules.d/. *-available files are not read.
 apache_conf_files() {
-  local roots=(/etc/apache2 /etc/httpd) r rp
-  for r in "${roots[@]}"; do
-    rp=$(rootp "$r")
-    [[ -d "$rp" ]] || continue
-    find "$rp" -maxdepth 3 -type f \( -name '*.conf' -o -name '*.load' \) 2>/dev/null || true
-  done
+  local rp d
+  rp=$(rootp /etc/apache2)
+  if [[ -d "$rp" ]]; then
+    [[ -f "$rp/apache2.conf" ]] && printf '%s\n' "$rp/apache2.conf"
+    for d in conf-enabled mods-enabled sites-enabled; do
+      [[ -d "$rp/$d" ]] || continue
+      find -L "$rp/$d" -maxdepth 1 -type f \( -name '*.conf' -o -name '*.load' \) 2>/dev/null | sort || true
+    done
+  fi
+  rp=$(rootp /etc/httpd)
+  if [[ -d "$rp" ]]; then
+    for d in conf conf.d conf.modules.d; do
+      [[ -d "$rp/$d" ]] || continue
+      find -L "$rp/$d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort || true
+    done
+  fi
 }
 
-# --- discovery ---
+# --- discovery: find every PHP install (read-only) ---
 
 reset_findings() {
+  OTHER_NS=()
   F_SAPI=()
   F_PATH=()
   F_VERSION=()
@@ -1319,8 +1472,22 @@ consider_file() {
   SEEN+=("$key")
 
   local vertext="" version="" pre=0 raw="" major="" minor="" pkg="" pkgver="" back="unchecked"
-  local drop="" main="" pools="" note=""
-  if [[ "$kind" != "modphp" ]]; then
+  local drop="" main="" pools="" note="${2:-}"
+  if [[ "$kind" == "modphp" ]]; then
+    # M7: read the module's version string without loading it.
+    vertext=$(static_php_version "$path" || true)
+    parse_php_version_text "$vertext"
+    if [[ -n "$vertext" && "$PARSED_OK" -eq 1 ]]; then
+      version=$PARSED_TRIPLE
+      pre=$PARSED_PRE
+      raw=$vertext
+      major=$PARSED_MAJOR
+      minor=$PARSED_MINOR
+    fi
+  else
+    if ! trusted_to_run "$path"; then
+      note="${note} Not run: root does not own it, or others can write it or a directory above it. Version read from the file."
+    fi
     vertext=$(php_version_text_of "$path")
     parse_php_version_text "$vertext"
     if [[ "$PARSED_OK" -eq 1 ]]; then
@@ -1337,7 +1504,10 @@ consider_file() {
       minor=$SERIES_MINOR
     fi
   fi
-  pkg_of_path "$path"
+  pkg_of_path "$real"
+  if [[ -z "$FOUND_PKG" && "$real" != "$path" ]]; then
+    pkg_of_path "$path"
+  fi
   pkg=$FOUND_PKG
   pkgver=$FOUND_PKGVER
   if [[ -z "$version" && -n "$pkgver" ]]; then
@@ -1352,7 +1522,9 @@ consider_file() {
   fi
   if [[ -n "$major" && -n "$minor" ]]; then
     back=$(backport_state_for "$major" "$minor" "$pkg")
-    if locate_layout "$major" "$minor" "$kind"; then
+    local logical_real=$real
+    [[ -n "$TEST_ROOT" ]] && logical_real=${real#"$TEST_ROOT"}
+    if locate_layout "$major" "$minor" "$kind" "$logical_real" || php_ini_layout "$path" "$kind"; then
       main=$LOC_MAIN
       drop=$LOC_DROPIN
       if [[ -n "$LOC_POOLS" && -d "$(rootp "$LOC_POOLS")" ]]; then
@@ -1369,7 +1541,7 @@ consider_file() {
       fi
     fi
   else
-    note="series not identified."
+    note="${note} series not identified."
   fi
   if [[ "$kind" == "modphp" ]]; then
     MOD_PHP=1
@@ -1399,10 +1571,13 @@ discover_dirs() {
     /usr/local/lsws/bin /usr/local/lsws/fcgi-bin; do
     walk_dir "$(rootp "$d")"
   done
-  local remi
-  remi=$(rootp /opt/remi)
-  if [[ -d "$remi" ]]; then
-    for d in "$remi"/php*/root/usr/bin "$remi"/php*/root/usr/sbin; do
+  local opt
+  opt=$(rootp /opt)
+  if [[ -d "$opt" ]]; then
+    for d in "$opt"/remi/php*/root/usr/bin "$opt"/remi/php*/root/usr/sbin \
+      "$opt"/cpanel/ea-php*/root/usr/bin "$opt"/cpanel/ea-php*/root/usr/sbin \
+      "$opt"/plesk/php/*/bin "$opt"/plesk/php/*/sbin \
+      "$opt"/alt/php*/usr/bin "$opt"/alt/php*/usr/sbin; do
       [[ -d "$d" ]] || continue
       walk_dir "$d"
     done
@@ -1467,68 +1642,99 @@ load_apache_modules() {
   fi
 }
 
+# True when two paths are the same file (same device and inode).
+same_file() {
+  local a b
+  a=$(stat -L -c '%d:%i' "$1" 2>/dev/null) || return 1
+  b=$(stat -L -c '%d:%i' "$2" 2>/dev/null) || return 1
+  [[ "$a" == "$b" ]]
+}
+
+# A PHP process in another mount namespace, usually a container. Its path
+# means nothing on the host, so it is only reported, never changed.
+record_other_ns() {
+  local pid=$1 path=$2 exe=$3 text ver="" status="UNKNOWN" fixed
+  text=$(static_php_version "$exe" || true)
+  parse_php_version_text "$text"
+  if [[ -n "$text" && "$PARSED_OK" -eq 1 ]]; then
+    ver=$PARSED_TRIPLE
+    if fixed=$(fixed_triple "$PARSED_MAJOR" "$PARSED_MINOR") && version_ge "$PARSED_TRIPLE" "$fixed"; then
+      status="PATCHED"
+    else
+      status="BELOW_FIX"
+    fi
+  fi
+  OTHER_NS+=("${pid}"$'\t'"${path}"$'\t'"${ver:-unknown}"$'\t'"${status}")
+}
+
+# Running PHP processes. Their binaries are never run from /proc: a process
+# can belong to any user. A live file on disk goes through consider_file,
+# which runs it only when it is root-only. A deleted binary is read in
+# place for its version string and reported as its own finding, because the
+# code in memory is no longer the file on disk.
 discover_procs() {
-  local procroot pid dir exe raw deleted base kind
+  local procroot pid dir raw deleted base kind key i real
   procroot=$(rootp /proc)
   [[ -d "$procroot" ]] || return 0
+  local self_ns ns
+  self_ns=$(readlink "$procroot/self/ns/mnt" 2>/dev/null || true)
   for dir in "$procroot"/[0-9]*; do
     [[ -d "$dir" ]] || continue
     pid=$(basename "$dir")
-    [[ -r "$dir/exe" || -L "$dir/exe" ]] || continue
     raw=$(readlink "$dir/exe" 2>/dev/null || true)
     [[ -n "$raw" ]] || continue
     deleted=0
     if [[ "$raw" == *" (deleted)" ]]; then
       deleted=1
-      ANY_RUNNING_DELETED=1
       raw=${raw%" (deleted)"}
     fi
     base=$(basename "$raw")
     kind=$(php_binary_kind "$base")
     [[ -n "$kind" ]] || continue
-    local key="${kind}|${raw}"
-    if seen_key "$key"; then
-      if [[ "$deleted" -eq 1 ]]; then
-        local i
-        for i in "${!F_PATH[@]}"; do
-          if [[ "${F_PATH[i]}" == "$raw" || "$(readlink -f "${F_PATH[i]}" 2>/dev/null || true)" == "$raw" ]]; then
-            F_DELETED[i]=1
-            F_NOTE[i]="${F_NOTE[i]} running process ${pid} is mapped to a deleted binary."
-          fi
-        done
+    ns=$(readlink "$dir/ns/mnt" 2>/dev/null || true)
+    if [[ -n "$self_ns" && -n "$ns" && "$ns" != "$self_ns" ]] && ! same_file "$dir/exe" "$(rootp "$raw")"; then
+      record_other_ns "$pid" "$raw" "$dir/exe"
+      continue
+    fi
+    if [[ "$deleted" -eq 0 ]]; then
+      local phys
+      phys=$(rootp "$raw")
+      real=$(readlink -f "$phys" 2>/dev/null || true)
+      key="${kind}|${real:-$phys}"
+      if ! seen_key "$key" && [[ -e "$phys" ]]; then
+        consider_file "$phys" "seen as pid ${pid}."
       fi
       continue
     fi
-    local vertext="" version="" pre=0
-    if [[ -x "$dir/exe" ]]; then
-      vertext=$(php_version_text_of "$dir/exe")
-      parse_php_version_text "$vertext"
-      if [[ "$PARSED_OK" -eq 1 ]]; then
-        version=$PARSED_TRIPLE
-        pre=$PARSED_PRE
+    ANY_RUNNING_DELETED=1
+    for i in "${!F_PATH[@]}"; do
+      if [[ "${F_PATH[i]}" == "$raw" || "$(readlink -f "${F_PATH[i]}" 2>/dev/null || true)" == "$raw" ]]; then
+        F_DELETED[i]=1
+        F_NOTE[i]="${F_NOTE[i]} running process ${pid} is mapped to a deleted binary."
       fi
-    fi
-    local major="" minor="" back="unchecked" drop="" main="" pools="" note="seen as pid ${pid}."
-    if [[ -n "$version" ]]; then
+    done
+    key="deleted|${kind}|${raw}"
+    seen_key "$key" && continue
+    SEEN+=("$key")
+    local vertext="" version="" pre=0 major="" minor="" drop="" main=""
+    local note="pid ${pid} runs a deleted binary. Version read from memory without running it. Restart the service."
+    vertext=$(static_php_version "$dir/exe" || true)
+    parse_php_version_text "$vertext"
+    if [[ -n "$vertext" && "$PARSED_OK" -eq 1 ]]; then
+      version=$PARSED_TRIPLE
+      pre=$PARSED_PRE
       major=$PARSED_MAJOR
       minor=$PARSED_MINOR
     elif series_from_basename "$base"; then
       major=$SERIES_MAJOR
       minor=$SERIES_MINOR
     fi
-    if [[ "$deleted" -eq 1 ]]; then
-      note="${note} binary deleted."
+    if [[ -n "$major" ]] && locate_layout "$major" "$minor" "$kind"; then
+      main=$LOC_MAIN
+      drop=$LOC_DROPIN
     fi
-    if [[ -n "$major" ]]; then
-      back=$(backport_state_for "$major" "$minor" "")
-      if locate_layout "$major" "$minor" "$kind"; then
-        main=$LOC_MAIN
-        drop=$LOC_DROPIN
-      fi
-    fi
-    SEEN+=("$key")
-    add_raw "$kind" "$raw" "$version" "$pre" "$vertext" "unknown" "" "$back" \
-      "$(risk_for "$kind")" "$drop" "$main" "$pools" "$deleted" "$note"
+    add_raw "$kind" "${raw} (deleted, pid ${pid})" "$version" "$pre" "$vertext" "unknown" "" "unchecked" \
+      "$(risk_for "$kind")" "$drop" "$main" "" "1" "$note"
   done
 }
 
@@ -1557,6 +1763,9 @@ classify_all() {
     F_KIND[i]=$kind
     F_DETAIL[i]=$detail
     F_CNOTE[i]=$cnote
+    if [[ "${F_BACKPORT[i]}" == "missing" && "$status" != "PATCHED" ]]; then
+      F_NOTE[i]="${F_NOTE[i]} The changelog for ${F_PKG[i]} is not on this host, so a distro backport could not be checked. Check your distro's security tracker for ${F_PKG[i]} ${F_PKGVER[i]}."
+    fi
     if [[ "${F_DELETED[i]}" -eq 1 && "$status" == "PATCHED" ]]; then
       F_NOTE[i]="${F_NOTE[i]} On-disk build looks patched and a deleted binary is still running."
     fi
@@ -1581,7 +1790,13 @@ count_status() {
 
 scan_code() {
   count_status
-  if ((COUNT_VULN + COUNT_MIT > 0)); then
+  local orow other_below=0
+  if [[ "$DO_CONTAINERS" -eq 1 ]]; then
+    for orow in "${OTHER_NS[@]+"${OTHER_NS[@]}"}"; do
+      [[ "$orow" == *$'\t'BELOW_FIX ]] && other_below=1
+    done
+  fi
+  if ((COUNT_VULN + COUNT_MIT + other_below > 0)); then
     printf '%s\n' "1"
   elif ((COUNT_UNK > 0)); then
     printf '%s\n' "3"
@@ -1595,7 +1810,7 @@ needs_menu() {
   ((COUNT_VULN + COUNT_MIT > 0))
 }
 
-# --- IOC ---
+# --- IOC: optional log checks, --ioc only (read-only) ---
 
 append_cap() {
   local name=$1 value=$2
@@ -1649,56 +1864,50 @@ file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '%s\n' "0"
 }
 
+CRASH_RE='[Ss]egfault|segmentation fault|core dumped|Allowed memory size|Maximum execution time exceeded'
+
 ioc_crashes() {
-  local f line n
+  local f n
   while IFS= read -r f; do
     [[ -r "$f" ]] || { IOC_NOTES+=("unreadable log: $f"); continue; }
-    n=0
-    while IFS= read -r line; do
-      n=$((n + 1))
-      if [[ "$line" == *[Ss]egfault* || "$line" == *"segmentation fault"* || "$line" == *"core dumped"* || "$line" == *"Allowed memory size"* || "$line" == *"Maximum execution time exceeded"* ]]; then
-        append_cap IOC_CRASHES "${f}:${n}"
-      fi
-    done <"$f"
+    while IFS=: read -r n _; do
+      [[ -n "$n" ]] && append_cap IOC_CRASHES "${f}:${n}"
+    done < <(grep -nE -- "$CRASH_RE" "$f" 2>/dev/null || true)
   done < <(ioc_log_files)
   if [[ -z "$TEST_ROOT" ]] && command -v journalctl >/dev/null 2>&1; then
-    local jout
-    jout=$(journalctl --since "${IOC_SINCE} 00:00:00" --no-pager -n 400 2>/dev/null || true)
-    n=0
-    while IFS= read -r line; do
-      n=$((n + 1))
-      if [[ "$line" == *[Ss]egfault* || "$line" == *"segmentation fault"* || "$line" == *"core dumped"* || "$line" == *"Allowed memory size"* || "$line" == *"Maximum execution time exceeded"* ]]; then
-        append_cap IOC_CRASHES "journalctl:${n}"
-      fi
-    done <<<"$jout"
+    # Only the time of each matching entry is reported, not its text.
+    local ts
+    while IFS=' ' read -r ts _; do
+      [[ -n "$ts" ]] && append_cap IOC_CRASHES "journalctl ${ts}"
+    done < <(journalctl --since "${IOC_SINCE} 00:00:00" --no-pager -o short-iso 2>/dev/null \
+      | grep -E -- "$CRASH_RE" || true)
   fi
 }
 
 ioc_access() {
-  local f line n tmp
+  local f n ip ipfile
+  ipfile=$(tmpfile)
+  printf '%s\n' "${WATCHED_IPS[@]}" >"$ipfile"
   while IFS= read -r f; do
     [[ -r "$f" ]] || { IOC_NOTES+=("unreadable access log: $f"); continue; }
-    tmp=$(mktemp)
-    if [[ "$f" == *.gz ]]; then
-      gzip -dc -- "$f" >"$tmp" 2>/dev/null || true
-    else
-      cp "$f" "$tmp"
-    fi
-    n=0
-    while IFS= read -r line; do
-      n=$((n + 1))
-      if [[ "$line" == *PHP_SESSION_UPLOAD_PROGRESS* ]]; then
-        append_cap IOC_UPLOADS "${f}:${n}"
-      fi
-      local ip
-      for ip in "${WATCHED_IPS[@]}"; do
-        if [[ "$line" == *"$ip"* ]]; then
-          append_cap IOC_IP_HITS "${ip} ${f}:${n}"
-        fi
-      done
-    done <"$tmp"
-    rm -f "$tmp"
+    # Stream the log once per pattern. Only file and line numbers are kept.
+    while IFS=: read -r n _; do
+      [[ -n "$n" ]] && append_cap IOC_UPLOADS "${f}:${n}"
+    done < <(read_log "$f" | grep -nF PHP_SESSION_UPLOAD_PROGRESS || true)
+    while IFS=' ' read -r n ip; do
+      [[ -n "$n" ]] && append_cap IOC_IP_HITS "${ip} ${f}:${n}"
+    done < <(read_log "$f" | awk 'NR == FNR {ips[$0]; next}
+      {for (ip in ips) if (index($0, ip)) {print FNR " " ip; break}}' "$ipfile" - || true)
   done < <(ioc_access_files)
+  rm -f "$ipfile"
+}
+
+read_log() {
+  if [[ "$1" == *.gz ]]; then
+    gzip -dc -- "$1" 2>/dev/null || true
+  else
+    cat -- "$1" 2>/dev/null || true
+  fi
 }
 
 web_roots() {
@@ -1850,22 +2059,29 @@ ioc_children_and_net() {
   done
 }
 
+# Established TCP connections owned by a web user whose local port is not
+# one this host listens on. Those are outbound: a web worker that dials out
+# is a strong hint. Inbound requests to the web server are skipped.
 parse_proc_net() {
-  local uid=$1 name=$2 file line
+  local uid=$1 name=$2 files=() file
   for file in "$(rootp /proc/net/tcp)" "$(rootp /proc/net/tcp6)"; do
-    [[ -r "$file" ]] || continue
-    while IFS= read -r line; do
-      [[ "$line" == sl* ]] && continue
-      # fields: sl local rem st ... uid
-      local hexrem st fuid
-      hexrem=$(printf '%s\n' "$line" | awk '{print $3}')
-      st=$(printf '%s\n' "$line" | awk '{print $4}')
-      fuid=$(printf '%s\n' "$line" | awk '{print $8}')
-      [[ "$fuid" == "$uid" ]] || continue
-      [[ "$st" == "01" ]] || continue
-      append_cap IOC_OUTBOUND "${name} uid ${uid} remote ${hexrem} state ESTABLISHED"
-    done <"$file"
+    [[ -r "$file" ]] && files+=("$file")
   done
+  [[ ${#files[@]} -gt 0 ]] || return 0
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && append_cap IOC_OUTBOUND "${name} uid ${uid} remote ${line} state ESTABLISHED"
+  done < <(awk -v u="$uid" '
+    FNR == 1 {next}
+    { split($2, l, ":"); port = l[length(l)] }
+    $4 == "0A" {listen[port] = 1; next}
+    $4 == "01" && $8 == u {cand[++n] = port " " $3}
+    END {
+      for (i = 1; i <= n; i++) {
+        split(cand[i], c, " ")
+        if (!(c[1] in listen)) print c[2]
+      }
+    }' "${files[@]}" 2>/dev/null)
 }
 
 ioc_scan() {
@@ -1887,13 +2103,13 @@ ioc_scan() {
   ioc_children_and_net
 }
 
-# --- containers ---
+# --- containers: optional, --containers only (read-only) ---
 
 scan_containers() {
   CONTAINER_NOTES=()
   CONTAINER_ROWS=()
   if [[ -n "$TEST_ROOT" ]]; then
-    local f
+    local f line
     f=$(rootp /fixture/docker-ps)
     if [[ -r "$f" ]]; then
       while IFS= read -r line; do
@@ -1904,57 +2120,63 @@ scan_containers() {
     fi
     return 0
   fi
-  if ! command -v docker >/dev/null 2>&1; then
-    CONTAINER_NOTES+=("docker is not installed")
+  local engines=() eng
+  for eng in docker podman; do
+    command -v "$eng" >/dev/null 2>&1 && engines+=("$eng")
+  done
+  if [[ ${#engines[@]} -eq 0 ]]; then
+    CONTAINER_NOTES+=("neither docker nor podman is installed")
     return 0
   fi
-  local line id image name
-  while IFS=$'\t' read -r id image name; do
-    [[ -n "$id" ]] || continue
-    if [[ "$image" == *[Pp][Hh][Pp]* || "$name" == *[Pp][Hh][Pp]* ]]; then
-      CONTAINER_ROWS+=("${id}"$'\t'"${image}"$'\t'"${name}"$'\t'"unverified")
-    fi
-  done < <(docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)
-  if [[ ${#CONTAINER_ROWS[@]} -eq 0 ]]; then
-    CONTAINER_NOTES+=("no running container image or name contains php")
-    return 0
-  fi
+  # Without --containers-exec only names and images are listed, so only the
+  # ones that look like PHP are shown. With it, every running container is
+  # asked, because a PHP app image is often not named after PHP.
   local do_exec=0
   if [[ "$CONTAINERS_EXEC" -eq 1 ]]; then
     do_exec=1
   elif [[ "$ASSUME_YES" -eq 0 && -t 0 && "$JSON" -eq 0 ]]; then
-    if confirm "Run read-only 'php -v' in the listed containers?"; then
+    if confirm "Run read-only 'php -v' in each running container?"; then
       do_exec=1
     fi
-  else
-    CONTAINER_NOTES+=("container versions were not read. Pass --containers-exec to allow docker exec php -v.")
+  fi
+  local id image name out ver any=0
+  for eng in "${engines[@]}"; do
+    while IFS=$'\t' read -r id image name; do
+      [[ -n "$id" ]] || continue
+      any=1
+      if [[ ! "$id" =~ ^[0-9a-fA-F]+$ ]]; then
+        CONTAINER_NOTES+=("skipped ${eng} container id that is not hex")
+        continue
+      fi
+      if [[ "$do_exec" -eq 0 ]]; then
+        if [[ "$image" == *[Pp][Hh][Pp]* || "$name" == *[Pp][Hh][Pp]* ]]; then
+          CONTAINER_ROWS+=("${id}"$'\t'"${image}"$'\t'"${name}"$'\t'"unverified")
+        fi
+        continue
+      fi
+      out=$(run_limited "$eng" exec "$id" php -v 2>/dev/null </dev/null || true)
+      parse_php_version_text "$out"
+      if [[ "$PARSED_OK" -eq 1 ]]; then
+        ver=$PARSED_TRIPLE
+      elif [[ "$image" == *[Pp][Hh][Pp]* || "$name" == *[Pp][Hh][Pp]* ]]; then
+        ver="unknown"
+      else
+        continue
+      fi
+      CONTAINER_ROWS+=("${id}"$'\t'"${image}"$'\t'"${name}"$'\t'"${ver}")
+    done < <("$eng" ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}' 2>/dev/null || true)
+  done
+  if [[ "$any" -eq 0 ]]; then
+    CONTAINER_NOTES+=("no running containers")
+  elif [[ ${#CONTAINER_ROWS[@]} -eq 0 ]]; then
+    CONTAINER_NOTES+=("no running container showed PHP")
   fi
   if [[ "$do_exec" -eq 0 ]]; then
-    return 0
-  fi
-  local row out ver
-  local updated=()
-  for row in "${CONTAINER_ROWS[@]}"; do
-    id=${row%%$'\t'*}
-    if [[ ! "$id" =~ ^[0-9a-fA-F]+$ ]]; then
-      CONTAINER_NOTES+=("skipped container id that is not hex")
-      continue
-    fi
-    out=$(docker exec "$id" php -v 2>&1 || true)
-    parse_php_version_text "$out"
-    if [[ "$PARSED_OK" -eq 1 ]]; then
-      ver=$PARSED_TRIPLE
-    else
-      ver="unknown"
-    fi
-    updated+=("${row%unverified}${ver}")
-  done
-  if [[ ${#updated[@]} -gt 0 ]]; then
-    CONTAINER_ROWS=("${updated[@]}")
+    CONTAINER_NOTES+=("container versions were not read. Pass --containers-exec to run php -v in every running container.")
   fi
 }
 
-# --- report ---
+# --- report: print results, set exit code ---
 
 status_color() {
   case "$1" in
@@ -2102,6 +2324,18 @@ human_report() {
       printf '  note: %s\n' "$item"
     done
   fi
+  if [[ ${#OTHER_NS[@]} -gt 0 ]]; then
+    printf '\n%sPHP running in containers or other namespaces%s\n' "$BOLD" "$RESET"
+    local orow opid opath over ostat
+    for orow in "${OTHER_NS[@]}"; do
+      IFS=$'\t' read -r opid opath over ostat <<<"$orow"
+      printf '  pid %s  %s  PHP %s  %s\n' "$opid" "$opath" "$over" "$ostat"
+    done
+    printf '  These are not changed by --fix or --workarounds. BELOW_FIX means the\n'
+    printf '  upstream version is older than the fix. A distro build inside may still\n'
+    printf '  carry a backport. Check or rebuild the image. They set the exit code\n'
+    printf '  only with --containers.\n'
+  fi
   if [[ "$DO_CONTAINERS" -eq 1 ]]; then
     printf '\n%sContainers%s\n' "$BOLD" "$RESET"
     local row
@@ -2209,6 +2443,16 @@ json_report() {
   else
     printf '  "containers": null,\n'
   fi
+  printf '  "other_namespace_processes": ['
+  local ofirst=1 orow opid opath over ostat
+  for orow in "${OTHER_NS[@]+"${OTHER_NS[@]}"}"; do
+    IFS=$'\t' read -r opid opath over ostat <<<"$orow"
+    if [[ "$ofirst" -eq 0 ]]; then printf ', '; fi
+    ofirst=0
+    printf '{"pid": %s, "path": %s, "version": %s, "status": %s}' "$(json_string "$opid")" \
+      "$(json_string "$opath")" "$(json_string "$over")" "$(json_string "$ostat")"
+  done
+  printf '],\n'
   printf '  "warnings": '
   json_array_strings "${WARNINGS[@]+"${WARNINGS[@]}"}"
   printf ',\n  "actions": '
@@ -2216,17 +2460,25 @@ json_report() {
   printf '\n}\n'
 }
 
-# --- backup, restart, edits ---
+# --- backup, restart, edits: WRITES, only reached after a yes ---
 
 safe_logical_path() {
   case "$1" in
+    */../*|*/..) return 1 ;;
     /etc/*|/usr/local/etc/*|/usr/local/lsws/conf/*) return 0 ;;
+    /opt/cpanel/ea-php*/root/etc/*|/opt/plesk/php/*/etc/*|/opt/alt/php*/etc/*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 begin_backup() {
-  BACKUP_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+  local base n=0
+  base=$(date -u +%Y%m%dT%H%M%SZ)
+  BACKUP_STAMP=$base
+  while [[ -e "$(rootp "/var/backups/stacutis/${BACKUP_STAMP}")" ]]; do
+    n=$((n + 1))
+    BACKUP_STAMP="${base}-${n}"
+  done
   BACKUP_DIR=$(rootp "/var/backups/stacutis/${BACKUP_STAMP}")
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: would create ${BACKUP_DIR}"
@@ -2234,16 +2486,23 @@ begin_backup() {
   fi
   local parent
   parent=$(dirname "$BACKUP_DIR")
-  mkdir -p "$parent"
+  mkdir -p "$parent" || { err "could not create ${parent}"; return 1; }
   chmod 700 "$parent" 2>/dev/null || true
-  mkdir -m 700 "$BACKUP_DIR"
-  mkdir -m 700 "$BACKUP_DIR/files"
-  {
+  # mkdir without -p fails if another run took the same name in the meantime.
+  if ! mkdir -m 700 "$BACKUP_DIR" || ! mkdir -m 700 "$BACKUP_DIR/files"; then
+    err "could not create a new backup directory ${BACKUP_DIR}"
+    BACKUP_DIR=""
+    return 1
+  fi
+  if ! {
     printf 'STACUTIS_BACKUP 1\n'
     printf 'STAMP %s\n' "$BACKUP_STAMP"
     printf 'PM %s\n' "$PM"
     printf 'TOOL %s\n' "$TOOL_VERSION"
-  } >"$BACKUP_DIR/manifest"
+  } >"$BACKUP_DIR/manifest"; then
+    err "could not write ${BACKUP_DIR}/manifest"
+    return 1
+  fi
   note_action "backup ${BACKUP_STAMP} at ${BACKUP_DIR}"
 }
 
@@ -2258,8 +2517,8 @@ seal_backup() {
 backup_existing() {
   local logical=$1 src dest
   safe_logical_path "$logical" || {
-    warn "refusing to back up path outside config roots: $logical"
-    return 0
+    err "refusing to back up path outside config roots: $logical"
+    return 1
   }
   src=$(rootp "$logical")
   [[ -e "$src" ]] || return 0
@@ -2267,10 +2526,137 @@ backup_existing() {
     say "dry-run: would back up ${logical}"
     return 0
   fi
+  # Keep the first copy. A second backup in the same run would save our own edit.
+  if grep -qxF "EXISTING ${logical}" "$BACKUP_DIR/manifest" 2>/dev/null; then
+    return 0
+  fi
   dest="${BACKUP_DIR}/files${logical}"
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$src" "$dest"
-  printf 'EXISTING %s\n' "$logical" >>"$BACKUP_DIR/manifest"
+  if ! mkdir -p "$(dirname "$dest")" || ! cp -a "$src" "$dest"; then
+    err "could not back up ${logical}"
+    return 1
+  fi
+  printf 'EXISTING %s\n' "$logical" >>"$BACKUP_DIR/manifest" || return 1
+}
+
+# Puts a finished temp file in place. The temp file lives in the same
+# directory, so the rename is atomic. It keeps owner, group and mode of the
+# file it replaces and restores the SELinux label when restorecon exists.
+install_tmp() {
+  local tmp=$1 path=$2
+  if [[ -e "$path" ]]; then
+    chmod --reference="$path" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+    chown --reference="$path" "$tmp" 2>/dev/null || true
+  else
+    chmod 644 "$tmp"
+  fi
+  if ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    err "could not write ${path}"
+    return 1
+  fi
+  if [[ -z "$TEST_ROOT" ]] && command -v restorecon >/dev/null 2>&1; then
+    restorecon "$path" 2>/dev/null || true
+  fi
+  return 0
+}
+
+new_tmp_beside() {
+  mktemp "$(dirname "$1")/.stacutis-php2shell.XXXXXX" 2>/dev/null || {
+    err "could not create a temp file next to $1"
+    return 1
+  }
+}
+
+# Undo this run's edits from its own backup: remove files it created and put
+# back files it changed. Used by --rollback and after a failed write or a
+# failed config test.
+restore_backup_files() {
+  local dir=$1 kind path src dest bad=0
+  while IFS=' ' read -r kind path _; do
+    [[ "$kind" == "CREATED" ]] || continue
+    case "$(basename "$path")" in
+      *stacutis-php2shell*) ;;
+      *)
+        err "manifest contains an unexpected created path: $path"
+        return 4
+        ;;
+    esac
+    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
+    rm -f "$(rootp "$path")" || bad=1
+    note_action "removed ${path}"
+  done <"$dir/manifest"
+  while IFS=' ' read -r kind path _; do
+    [[ "$kind" == "EXISTING" ]] || continue
+    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
+    src="${dir}/files${path}"
+    dest=$(rootp "$path")
+    if [[ ! -e "$src" ]]; then
+      err "backup is missing ${src}"
+      return 4
+    fi
+    if [[ -d "$dest" && ! -L "$dest" ]]; then
+      err "refusing to replace directory ${path}"
+      return 4
+    fi
+    if mkdir -p "$(dirname "$dest")" && rm -f "$dest" && cp -a "$src" "$dest"; then
+      note_action "restored ${path}"
+    else
+      err "could not restore ${path}"
+      bad=1
+    fi
+  done <"$dir/manifest"
+  [[ "$bad" -eq 0 ]] || return 4
+  return 0
+}
+
+# Runs the services' own config checks before any restart. A broken config
+# must not take the site down. Binaries are run only when trusted_to_run.
+config_tests_pass() {
+  if [[ -n "$TEST_ROOT" ]]; then
+    if [[ -e "$(rootp /fixture/configtest-fail)" ]]; then
+      err "config test failed: $(cat "$(rootp /fixture/configtest-fail)")"
+      return 1
+    fi
+    return 0
+  fi
+  local i bin outp seen=$'\n' failed=0 c
+  for i in "${!F_SAPI[@]}"; do
+    [[ "${F_SAPI[i]}" == "fpm" ]] || continue
+    bin=${F_PATH[i]}
+    [[ "$bin" == *" (deleted"* || ! -x "$bin" ]] && continue
+    [[ "$seen" == *$'\n'"$bin"$'\n'* ]] && continue
+    seen="${seen}${bin}"$'\n'
+    trusted_to_run "$bin" || continue
+    if ! outp=$("$bin" -t 2>&1 </dev/null); then
+      err "config test failed for ${bin}:"
+      printf '%s\n' "$outp" | tail -n 5 >&2
+      failed=1
+    fi
+  done
+  if [[ -d /etc/apache2 || -d /etc/httpd ]]; then
+    for c in apache2ctl apachectl httpd; do
+      command -v "$c" >/dev/null 2>&1 || continue
+      if ! outp=$("$c" -t 2>&1 </dev/null); then
+        err "Apache config test failed (${c} -t):"
+        printf '%s\n' "$outp" | tail -n 5 >&2
+        failed=1
+      fi
+      break
+    done
+  fi
+  return "$failed"
+}
+
+# After a failed write or config test: put the old files back and do not
+# restart anything.
+undo_run_edits() {
+  [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/manifest" ]] || return 1
+  if restore_backup_files "$BACKUP_DIR"; then
+    say "Restored the previous config files from ${BACKUP_STAMP}. No service was restarted."
+    return 0
+  fi
+  err "could not fully restore from ${BACKUP_DIR}. Run --rollback ${BACKUP_STAMP} after fixing the cause."
+  return 1
 }
 
 record_created() {
@@ -2333,7 +2719,7 @@ list_services() {
 
 service_wanted() {
   case "$1" in
-    php*-fpm|php-fpm*|apache2|httpd|lsws|lshttpd|frankenphp*)
+    php*-fpm|php-fpm*|ea-php*-php-fpm|plesk-php*-fpm|alt-php*-fpm|apache2|httpd|lsws|lshttpd|frankenphp*)
       return 0
       ;;
   esac
@@ -2365,8 +2751,10 @@ web_sapi_present() {
   return 1
 }
 
+# restart_one SERVICE [restart|reload]. A reload is enough after a config-only
+# change and keeps requests in flight. It falls back to a restart.
 restart_one() {
-  local svc=$1
+  local svc=$1 action=${2:-restart}
   record_service "$svc"
   if [[ "$DRY_RUN" -eq 1 ]]; then
     return 0
@@ -2374,11 +2762,16 @@ restart_one() {
   if [[ -n "$TEST_ROOT" ]]; then
     mkdir -p "$(rootp /fixture)"
     printf '%s\n' "$svc" >>"$(rootp /fixture/restarts.log)"
-    note_action "test-root restart ${svc}"
+    note_action "test-root ${action} ${svc}"
     RESTARTS_DONE=$((RESTARTS_DONE + 1))
     return 0
   fi
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if [[ "$action" == "reload" ]] && systemctl reload "$svc"; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if systemctl restart "$svc"; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2386,6 +2779,11 @@ restart_one() {
     fi
   fi
   if command -v rc-service >/dev/null 2>&1; then
+    if [[ "$action" == "reload" ]] && rc-service "$svc" reload; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if rc-service "$svc" restart; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2393,6 +2791,11 @@ restart_one() {
     fi
   fi
   if command -v service >/dev/null 2>&1; then
+    if [[ "$action" == "reload" ]] && service "$svc" reload; then
+      note_action "reloaded ${svc}"
+      RESTARTS_DONE=$((RESTARTS_DONE + 1))
+      return 0
+    fi
     if service "$svc" restart; then
       note_action "restarted ${svc}"
       RESTARTS_DONE=$((RESTARTS_DONE + 1))
@@ -2403,16 +2806,51 @@ restart_one() {
   return 1
 }
 
+# True when SERVICE runs one of the vulnerable PHP builds found by the scan.
+# A host with several PHP branches only restarts the ones that changed.
+service_affected() {
+  local svc=$1 i dotted compact base
+  while IFS= read -r i; do
+    case "${F_SAPI[i]}" in
+      modphp)
+        [[ "$svc" == apache2 || "$svc" == httpd ]] && return 0
+        ;;
+      litespeed)
+        [[ "$svc" == lsws || "$svc" == lshttpd ]] && return 0
+        ;;
+      frankenphp)
+        [[ "$svc" == frankenphp* ]] && return 0
+        ;;
+      fpm)
+        [[ -n "${F_VERSION[i]}" ]] || { [[ "$svc" == *fpm* ]] && return 0; continue; }
+        dotted=$(printf '%s\n' "${F_VERSION[i]}" | cut -d. -f1,2)
+        compact=${dotted/./}
+        case "$svc" in
+          "php${dotted}-fpm"|"php${compact}-fpm"|"php-fpm${dotted}"|"php-fpm${compact}"|"php${compact}-php-fpm"|"ea-php${compact}-php-fpm"|"plesk-php${compact}-fpm"|"alt-php${compact}-fpm")
+            return 0
+            ;;
+          php-fpm)
+            base=$(basename "${F_PATH[i]%% (deleted*}")
+            [[ "$base" == php-fpm ]] && return 0
+            ;;
+        esac
+        ;;
+    esac
+  done < <(vulnerable_indexes)
+  return 1
+}
+
 restart_affected() {
-  local svc seen=$'\n' failed=0
+  local action=${1:-restart} svc seen=$'\n' failed=0
   RESTARTS_DONE=0
   while IFS= read -r svc; do
     [[ -n "$svc" ]] || continue
     service_wanted "$svc" || continue
+    service_affected "$svc" || continue
     [[ "$seen" == *$'\n'"$svc"$'\n'* ]] && continue
     seen="${seen}${svc}"$'\n'
     if service_is_active "$svc"; then
-      restart_one "$svc" || failed=1
+      restart_one "$svc" "$action" || failed=1
     else
       say "service ${svc} is not active; leaving it stopped"
     fi
@@ -2429,7 +2867,7 @@ restart_affected() {
 
 write_marked_file() {
   local logical=$1 begin=$2 end=$3 block=$4
-  local path tmp mode
+  local path tmp
   safe_logical_path "$logical" || return 1
   path=$(rootp "$logical")
   if [[ -L "$path" ]]; then
@@ -2439,38 +2877,50 @@ write_marked_file() {
       err "refusing to follow a symlink outside the test root: $logical"
       return 1
     fi
+    if [[ -z "$TEST_ROOT" ]] && ! safe_logical_path "$real"; then
+      err "refusing to follow ${logical} to ${real}, outside config roots"
+      return 1
+    fi
+    path=$real
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: would update ${logical} between markers"
-    emit_notice <<EOF
+    emit_notice <<EOF2
 ${begin}
 ${block}
 ${end}
-EOF
+EOF2
     return 0
   fi
-  mkdir -p "$(dirname "$path")"
-  tmp=$(mktemp)
+  mkdir -p "$(dirname "$path")" || { err "could not create $(dirname "$logical")"; return 1; }
+  tmp=$(new_tmp_beside "$path") || return 1
   if [[ -f "$path" ]]; then
-    awk -v b="$begin" -v e="$end" '
+    if ! awk -v b="$begin" -v e="$end" '
       $0 == b {skip=1; next}
       $0 == e {skip=0; next}
       skip == 1 {next}
-      {print}
-    ' "$path" >"$tmp"
-    mode=$(stat -c %a "$path" 2>/dev/null || echo 644)
+      /^[[:space:]]*$/ {blank++; next}
+      {while (blank > 0) {print ""; blank--}; print}
+    ' "$path" >"$tmp"; then
+      rm -f "$tmp"
+      err "could not read ${logical}"
+      return 1
+    fi
   else
-    : >"$tmp"
-    mode=644
-    record_created "$logical"
+    record_created "$logical" || { rm -f "$tmp"; return 1; }
   fi
-  {
-    printf '\n%s\n' "$begin"
+  local sep=""
+  [[ -s "$tmp" ]] && sep=$'\n'
+  if ! {
+    printf '%s%s\n' "$sep" "$begin"
     printf '%s\n' "$block"
     printf '%s\n' "$end"
-  } >>"$tmp"
-  chmod "$mode" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$path"
+  } >>"$tmp"; then
+    rm -f "$tmp"
+    err "could not write ${logical}"
+    return 1
+  fi
+  install_tmp "$tmp" "$path" || return 1
   note_action "updated ${logical}"
 }
 
@@ -2527,12 +2977,14 @@ apache_admin_block() {
   if [[ "$DO_UNLIMITED_MEM" -eq 1 ]]; then
     inner="${inner}"$'\n'"    php_admin_value memory_limit -1"
   fi
+  # PHP 8 registers php_module, PHP 7 registers php7_module.
   printf '<IfModule php_module>\n    %s\n</IfModule>\n' "$inner"
+  printf '<IfModule php7_module>\n    %s\n</IfModule>\n' "$inner"
 }
 
 inject_pool_file() {
   local logical=$1 block=$2
-  local path tmp stripped blockfile mode
+  local path tmp stripped blockfile
   safe_logical_path "$logical" || return 1
   path=$(rootp "$logical")
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -2540,22 +2992,33 @@ inject_pool_file() {
     printf '%s\n' "$block" | emit_notice
     return 0
   fi
-  [[ -f "$path" ]] || return 1
-  tmp=$(mktemp)
-  stripped=$(mktemp)
-  blockfile=$(mktemp)
+  [[ -f "$path" ]] || { err "pool file is missing: ${logical}"; return 1; }
+  if [[ -L "$path" ]]; then
+    path=$(readlink -f "$path") || return 1
+  fi
+  tmp=$(new_tmp_beside "$path") || return 1
+  stripped=$(tmpfile) || { rm -f "$tmp"; return 1; }
+  blockfile=$(tmpfile) || { rm -f "$tmp" "$stripped"; return 1; }
   printf '%s\n' "$block" >"$blockfile"
-  awk -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" -v limit="$DO_MAX_REQUESTS" '
-    $0 == b {skip=1; next}
+  if ! awk -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" -v limit="$DO_MAX_REQUESTS" '
+    function flush() { while (blank > 0) { print ""; blank-- } }
+    $0 == b {skip=1; blank=0; next}
     $0 == e {skip=0; next}
     skip == 1 {next}
+    /^[[:space:]]*$/ {blank++; next}
     limit == 1 && $0 ~ /^[[:space:]]*pm\.max_requests[[:space:]]*=/ {
+      flush()
       print "; stacutis-php2shell previous: " $0
       next
     }
-    {print}
-  ' "$path" >"$stripped"
-  awk -v bf="$blockfile" -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" '
+    {flush(); print}
+    END {flush()}
+  ' "$path" >"$stripped"; then
+    rm -f "$tmp" "$stripped" "$blockfile"
+    err "could not read ${logical}"
+    return 1
+  fi
+  if ! awk -v bf="$blockfile" -v b="; stacutis-php2shell begin" -v e="; stacutis-php2shell end" '
     function emit(   line) {
       print ""
       print b
@@ -2571,11 +3034,13 @@ inject_pool_file() {
     }
     {print}
     END { if (seen) emit() }
-  ' "$stripped" >"$tmp"
-  mode=$(stat -c %a "$path" 2>/dev/null || echo 644)
-  chmod "$mode" "$tmp" 2>/dev/null || true
-  mv "$tmp" "$path"
+  ' "$stripped" >"$tmp"; then
+    rm -f "$tmp" "$stripped" "$blockfile"
+    err "could not write ${logical}"
+    return 1
+  fi
   rm -f "$stripped" "$blockfile"
+  install_tmp "$tmp" "$path" || return 1
   note_action "updated pool ${logical}"
 }
 
@@ -2717,7 +3182,8 @@ apply_workarounds() {
       return 1
     fi
   fi
-  begin_backup
+  begin_backup || { err "no backup could be made. Nothing was changed."; return 4; }
+  local failed=0
   local seen_drop=$'\n'
   while IFS= read -r i; do
     [[ -n "${F_VERSION[i]}" ]] || continue
@@ -2729,10 +3195,10 @@ apply_workarounds() {
       seen_drop="${seen_drop}${drop}"$'\n'
       logical="${drop}/99-stacutis-php2shell.ini"
       if [[ "$DRY_RUN" -eq 0 && ! -d "$(rootp "$drop")" ]]; then
-        mkdir -p "$(rootp "$drop")"
+        mkdir -p "$(rootp "$drop")" || failed=1
       fi
       if [[ -f "$(rootp "$logical")" ]]; then
-        backup_existing "$logical"
+        backup_existing "$logical" || failed=1
       fi
       local block
       block=$(dropin_block "$major" "$minor")
@@ -2742,14 +3208,16 @@ apply_workarounds() {
       if [[ "$WORK_UPLOAD" -eq 0 ]]; then
         block=$(printf '%s\n' "$block" | awk '!/session.upload_progress/')
       fi
-      write_marked_file "$logical" "; stacutis-php2shell begin" "; stacutis-php2shell end" "$block"
+      if [[ "$failed" -eq 0 ]]; then
+        write_marked_file "$logical" "; stacutis-php2shell begin" "; stacutis-php2shell end" "$block" || failed=1
+      fi
     fi
     if [[ "${F_SAPI[i]}" == "fpm" || "${F_SAPI[i]}" == "frankenphp" || "${F_SAPI[i]}" == "litespeed" ]]; then
       local IFS=$'\x1e'
       for pool in ${F_POOLS[i]}; do
         IFS=$'\n\t'
-        [[ -n "$pool" ]] || continue
-        backup_existing "$pool"
+        [[ -n "$pool" && "$failed" -eq 0 ]] || continue
+        backup_existing "$pool" || { failed=1; continue; }
         local ablock
         ablock=$(fpm_admin_block "$major" "$minor")
         if [[ "$WORK_FATAL" -eq 0 ]]; then
@@ -2764,7 +3232,7 @@ apply_workarounds() {
         if [[ "$DO_MAX_REQUESTS" -eq 1 ]]; then
           ablock="${ablock}"$'\n'"pm.max_requests = 1"
         fi
-        inject_pool_file "$pool" "$ablock"
+        inject_pool_file "$pool" "$ablock" || failed=1
       done
       IFS=$'\n\t'
     fi
@@ -2787,21 +3255,35 @@ apply_workarounds() {
         fi
       done < <(vulnerable_indexes)
       if [[ -z "$a_major" ]]; then
-        a_major=8
-        a_minor=3
+        # No mod_php version: use the newest vulnerable branch found, so an
+        # 8.5 host still gets the 8.5 setting.
+        while IFS= read -r i; do
+          [[ -n "${F_VERSION[i]}" ]] || continue
+          rest=${F_VERSION[i]#*.}
+          local c_major=${F_VERSION[i]%%.*} c_minor=${rest%%.*}
+          [[ "$c_major" =~ ^[0-9]+$ && "$c_minor" =~ ^[0-9]+$ ]] || continue
+          if [[ -z "$a_major" ]] || (( c_major > a_major || (c_major == a_major && c_minor > a_minor) )); then
+            a_major=$c_major
+            a_minor=$c_minor
+          fi
+        done < <(vulnerable_indexes)
       fi
-      if [[ -f "$(rootp "$a_logical")" ]]; then
-        backup_existing "$a_logical"
+      if [[ "$failed" -eq 0 && -f "$(rootp "$a_logical")" ]]; then
+        backup_existing "$a_logical" || failed=1
       fi
       local ab
       ab=$(apache_admin_block "$a_major" "$a_minor")
-      write_marked_file "$a_logical" "# stacutis-php2shell begin" "# stacutis-php2shell end" "$ab"
+      if [[ "$failed" -eq 0 ]]; then
+        write_marked_file "$a_logical" "# stacutis-php2shell begin" "# stacutis-php2shell end" "$ab" || failed=1
+      fi
       if [[ "$a_logical" == /etc/apache2/conf-available/* ]]; then
         local link="/etc/apache2/conf-enabled/stacutis-php2shell.conf"
-        if [[ "$DRY_RUN" -eq 0 && -d "$(rootp /etc/apache2/conf-enabled)" && ! -e "$(rootp "$link")" ]]; then
-          ln -s ../conf-available/stacutis-php2shell.conf "$(rootp "$link")"
-          record_created "$link"
-          note_action "enabled apache conf ${link}"
+        if [[ "$failed" -eq 0 && "$DRY_RUN" -eq 0 && -d "$(rootp /etc/apache2/conf-enabled)" && ! -e "$(rootp "$link")" ]]; then
+          if record_created "$link" && ln -s ../conf-available/stacutis-php2shell.conf "$(rootp "$link")"; then
+            note_action "enabled apache conf ${link}"
+          else
+            failed=1
+          fi
         elif [[ "$DRY_RUN" -eq 1 ]]; then
           say "dry-run: would symlink ${link}"
         fi
@@ -2811,23 +3293,34 @@ apply_workarounds() {
     fi
   fi
 
+  if [[ "$failed" -eq 1 ]]; then
+    err "a config write failed. Putting the previous files back."
+    undo_run_edits
+    seal_backup
+    return 4
+  fi
   print_proxy_advice
   seal_backup
   if [[ "$DRY_RUN" -eq 1 ]]; then
     say "dry-run: no files written, no services restarted."
     return 0
   fi
+  if ! config_tests_pass; then
+    err "the new settings did not pass the config test. Putting the previous files back."
+    undo_run_edits
+    return 4
+  fi
   out ""
   out "${RED}Still VULNERABLE until PHP is upgraded.${RESET}"
   printf '\n%s%sStill VULNERABLE until PHP is upgraded.%s\n' "$BOLD" "$RED" "$RESET" >&2
-  if ! restart_affected; then
-    err "settings were written and at least one restart failed. Old workers may still be in memory."
+  if ! restart_affected reload; then
+    err "settings were written and at least one reload failed. Old workers may still be in memory."
     return 4
   fi
   return 0
 }
 
-# --- fix ---
+# --- fix: package upgrade, WRITES, only reached after a yes ---
 
 installed_packages_for_series() {
   local major=$1 minor=$2
@@ -2857,8 +3350,27 @@ installed_packages_for_series() {
         index($1, c "-") == 1 || $1 == c || index($1, d) == 1 {print}
       ' || true
   elif [[ "$PM" == "apk" ]]; then
-    apk info -e "php${major}${minor}" "php${major}${minor}-fpm" "php${major}${minor}-cli" 2>/dev/null || true
+    # Lines look like: php83-fpm-8.3.15-r0 x86_64 {php83} (PHP-3.01) [installed]
+    apk list --installed 2>/dev/null | awk -v c="php${major}${minor}" '
+      {
+        n = $1
+        if (match(n, /-[0-9][^-]*-r[0-9]+$/) == 0) next
+        name = substr(n, 1, RSTART - 1)
+        ver = substr(n, RSTART + 1)
+        if (name == c || index(name, c "-") == 1) print name "\t" ver
+      }' || true
   fi
+}
+
+# True when apt or dnf is told to keep this package where it is.
+package_is_held() {
+  local pkg=$1
+  [[ -z "$TEST_ROOT" ]] || { [[ -r "$(rootp /fixture/held)" ]] && grep -qxF "$pkg" "$(rootp /fixture/held)"; return; }
+  case "$PM" in
+    apt) apt-mark showhold 2>/dev/null | grep -qxF "$pkg" ;;
+    dnf) dnf versionlock list 2>/dev/null | grep -q "^${pkg}-[0-9]" ;;
+    *) return 1 ;;
+  esac
 }
 
 candidate_version_of() {
@@ -2880,11 +3392,14 @@ candidate_version_of() {
     return 0
   fi
   if [[ "$PM" == "dnf" ]]; then
-    dnf repoquery --queryformat '%{version}-%{release}' "$pkg" 2>/dev/null | awk 'END{print}'
+    # Only an upgrade for this exact package, newest first.
+    dnf -q repoquery --upgrades --latest-limit=1 --queryformat '%{version}-%{release}\n' "$pkg" 2>/dev/null \
+      | awk 'NF {v=$0} END {if (v != "") print v}'
     return 0
   fi
   if [[ "$PM" == "yum" ]]; then
-    yum list available "$pkg" 2>/dev/null | awk 'NR>1 && $1 ~ /^'"$pkg"'\./ {print $2; exit}'
+    yum -q list updates "$pkg" 2>/dev/null | awk -v p="$pkg" '
+      { n = $1; sub(/\.[^.]*$/, "", n); if (n == p) {print $2; exit} }'
     return 0
   fi
   if [[ "$PM" == "apk" ]]; then
@@ -2921,7 +3436,7 @@ package_is_acceptable_upgrade() {
     fi
   fi
   local tmp state
-  tmp=$(mktemp)
+  tmp=$(tmpfile)
   candidate_changelog_file "$pkg" "$tmp"
   if [[ -s "$tmp" ]]; then
     state=$(cve_state_file "$tmp")
@@ -2991,7 +3506,11 @@ print_fix_plan() {
       pkgs+=("$pkg")
       local cand reason color shown
       cand=$(candidate_version_of "$pkg" || true)
-      reason=$(package_is_acceptable_upgrade "$pkg" "$ver" "$cand" "$major" "$minor")
+      if package_is_held "$pkg"; then
+        reason="no: held by the package manager. This tool will not release a hold."
+      else
+        reason=$(package_is_acceptable_upgrade "$pkg" "$ver" "$cand" "$major" "$minor")
+      fi
       color=$RESET
       shown=$reason
       case "$reason" in
@@ -3042,7 +3561,7 @@ refresh_candidate_metadata() {
     return 0
   fi
   case "$PM" in
-    apt) apt-get update ;;
+    apt) apt-get -o DPkg::Lock::Timeout=120 update ;;
     dnf) dnf makecache -y ;;
     yum) yum makecache -y ;;
     apk) apk update ;;
@@ -3058,6 +3577,18 @@ fetch_apt_changelog() {
     return 0
   fi
   apt-get changelog "$pkg" >"$dest" 2>/dev/null || true
+  # The changelog server can return 404 for new security uploads. If this
+  # exact candidate is already installed, its local changelog is the same text.
+  if [[ ! -s "$dest" ]]; then
+    local inst cand doc
+    inst=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')
+    if [[ -n "$inst" && "$inst" == "$cand" ]]; then
+      for doc in "/usr/share/doc/${pkg}/changelog.Debian.gz" "/usr/share/doc/${pkg}/changelog.gz"; do
+        [[ -f "$doc" ]] && { append_changelog_file "$doc" "$dest"; break; }
+      done
+    fi
+  fi
 }
 
 apply_simulated_upgrade() {
@@ -3065,7 +3596,7 @@ apply_simulated_upgrade() {
   local table path line p ver f
   table=$(rootp /fixture/installed.tsv)
   local tmp
-  tmp=$(mktemp)
+  tmp=$(tmpfile)
   while IFS=$'\t' read -r p ver path || [[ -n "$p" ]]; do
     if [[ "$p" == "$pkg" ]]; then
       printf '%s\t%s\t%s\n' "$p" "$cand" "$path"
@@ -3092,6 +3623,10 @@ apply_simulated_upgrade() {
 do_fix() {
   require_root
   DO_LOG=1
+  if [[ -z "$(vulnerable_indexes)" ]]; then
+    say "No vulnerable PHP was found. Nothing to upgrade."
+    return 0
+  fi
   print_fix_plan
   if [[ "$PM" == "unknown" ]]; then
     err "no supported package manager; nothing was changed"
@@ -3105,23 +3640,30 @@ do_fix() {
     say "Stopped before any change."
     return 1
   fi
-  begin_backup
-  local i
+  begin_backup || { err "no backup could be made. Nothing was installed."; return 4; }
+  local i bfail=0
   while IFS= read -r i; do
     if [[ -n "${F_MAININI[i]}" && -f "$(rootp "${F_MAININI[i]}")" ]]; then
-      backup_existing "${F_MAININI[i]}"
+      backup_existing "${F_MAININI[i]}" || bfail=1
     fi
     local pool
     local IFS=$'\x1e'
     for pool in ${F_POOLS[i]}; do
       IFS=$'\n\t'
-      [[ -n "$pool" ]] && backup_existing "$pool"
+      if [[ -n "$pool" ]]; then
+        backup_existing "$pool" || bfail=1
+      fi
     done
     IFS=$'\n\t'
     if [[ -n "${F_PKG[i]}" && "${F_PKG[i]}" != "unknown" ]]; then
       record_package_version "${F_PKG[i]}" "${F_PKGVER[i]}"
     fi
   done < <(vulnerable_indexes)
+  if [[ "$bfail" -eq 1 ]]; then
+    err "a config backup failed. Nothing was installed."
+    seal_backup
+    return 4
+  fi
 
   if ! refresh_candidate_metadata; then
     err "could not refresh package metadata"
@@ -3139,17 +3681,27 @@ do_fix() {
     while IFS=$'\t' read -r pkg ver; do
       [[ -n "$pkg" ]] || continue
       cand=$(candidate_version_of "$pkg" || true)
-      reason=$(package_is_acceptable_upgrade "$pkg" "$ver" "$cand" "$major" "$minor")
+      if package_is_held "$pkg"; then
+        reason="no: held by the package manager. This tool will not release a hold."
+      else
+        reason=$(package_is_acceptable_upgrade "$pkg" "$ver" "$cand" "$major" "$minor")
+      fi
       if [[ "$reason" == recheck-after-update ]]; then
-        tmp=$(mktemp)
+        tmp=$(tmpfile)
         fetch_apt_changelog "$pkg" "$tmp"
-        state=$(cve_state_file "$tmp")
+        if [[ -s "$tmp" ]]; then
+          state=$(cve_state_file "$tmp")
+        else
+          state="nochangelog"
+        fi
         rm -f "$tmp"
         parse_php_version_text "$cand"
         if [[ "$PARSED_OK" -eq 1 && "$PARSED_PRE" -eq 0 ]] && fixed=$(fixed_triple "$PARSED_MAJOR" "$PARSED_MINOR") && version_ge "$PARSED_TRIPLE" "$fixed"; then
           reason="yes: candidate upstream ${PARSED_TRIPLE} is at least ${fixed}"
         elif [[ "$state" == "both" ]]; then
           reason="yes: apt changelog names both CVEs"
+        elif [[ "$state" == "nochangelog" ]]; then
+          reason="no: apt-get changelog ${pkg} returned nothing, so ${cand:-the candidate} could not be checked. Check the network and ca-certificates, then run again"
         else
           reason="no: after apt-get update, ${pkg} candidate ${cand:-none} is not a confirmed fix"
         fi
@@ -3177,8 +3729,7 @@ do_fix() {
 
   local unique
   unique=$(printf '%s\n' "${install_pkgs[@]}" | awk '!seen[$0]++')
-  # shellcheck disable=SC2206
-  install_pkgs=($unique)
+  mapfile -t install_pkgs < <(printf '%s\n' "$unique" | awk 'NF')
 
   if [[ -n "$TEST_ROOT" ]]; then
     local p
@@ -3188,25 +3739,38 @@ do_fix() {
       note_action "test-root simulated upgrade ${p} -> ${cand}"
     done
   else
+    local pm_rc=0
     case "$PM" in
       apt)
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "${install_pkgs[@]}"
+        # Keep local config files, wait for a busy dpkg lock instead of failing.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+          -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+          "${install_pkgs[@]}" || pm_rc=$?
         ;;
       dnf)
-        dnf upgrade -y "${install_pkgs[@]}"
+        dnf upgrade -y "${install_pkgs[@]}" || pm_rc=$?
         ;;
       yum)
-        yum upgrade -y "${install_pkgs[@]}"
+        yum upgrade -y "${install_pkgs[@]}" || pm_rc=$?
         ;;
       apk)
-        apk upgrade "${install_pkgs[@]}"
+        apk upgrade "${install_pkgs[@]}" || pm_rc=$?
         ;;
     esac
+    if [[ "$pm_rc" -ne 0 ]]; then
+      err "the ${PM} upgrade failed (exit ${pm_rc}). No service was restarted. Check the package state before you restart anything."
+      seal_backup
+      return 4
+    fi
     note_action "upgraded: ${install_pkgs[*]}"
   fi
 
   seal_backup
-  if ! restart_affected; then
+  if ! config_tests_pass; then
+    err "the upgrade finished but the config test failed. No service was restarted, so the old workers keep serving. Fix the config, then restart PHP."
+    return 4
+  fi
+  if ! restart_affected restart; then
     err "upgrade finished and at least one restart failed. Workers may still be running the old binary."
     return 4
   fi
@@ -3239,38 +3803,15 @@ do_rollback() {
     say "Stopped before any change."
     return 1
   fi
-  local kind path src dest
-  while IFS=' ' read -r kind path _; do
-    [[ "$kind" == "CREATED" ]] || continue
-    case "$(basename "$path")" in
-      *stacutis-php2shell*) ;;
-      *)
-        err "manifest contains an unexpected created path: $path"
-        return 4
-        ;;
-    esac
-    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
-    rm -f "$(rootp "$path")"
-    note_action "removed ${path}"
-  done <"$dir/manifest"
-  while IFS=' ' read -r kind path _; do
-    [[ "$kind" == "EXISTING" ]] || continue
-    safe_logical_path "$path" || { err "refusing path $path"; return 4; }
-    src="${dir}/files${path}"
-    dest=$(rootp "$path")
-    if [[ ! -e "$src" ]]; then
-      err "backup is missing ${src}"
-      return 4
-    fi
-    if [[ -d "$dest" && ! -L "$dest" ]]; then
-      err "refusing to replace directory ${path}"
-      return 4
-    fi
-    mkdir -p "$(dirname "$dest")"
-    rm -f "$dest"
-    cp -a "$src" "$dest"
-    note_action "restored ${path}"
-  done <"$dir/manifest"
+  local rc=0 kind
+  restore_backup_files "$dir" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+  if ! config_tests_pass; then
+    err "the restored configs do not pass the config test. No service was restarted."
+    return 4
+  fi
   local svc
   while IFS=' ' read -r kind svc _; do
     [[ "$kind" == "SERVICE" ]] || continue
@@ -3395,9 +3936,15 @@ report_all() {
 }
 
 main() {
+  WORK_TMP=$(mktemp -d 2>/dev/null || true)
+  trap cleanup_tmp EXIT
+  trap 'exit 130' INT TERM
   parse_args "$@"
   setup_colors
   stale_data_warning
+  if [[ -z "$TEST_ROOT" && "$(id -u)" -ne 0 ]]; then
+    warn "not running as root: some files and /proc entries may be unreadable, so results can be UNKNOWN or incomplete."
+  fi
   if [[ "$LOG_FOR_SCAN" -eq 1 ]]; then
     DO_LOG=1
   fi
